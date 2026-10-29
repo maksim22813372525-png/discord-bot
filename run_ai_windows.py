@@ -275,6 +275,7 @@ def supervise_children(worker, node):
 def main():
     require_runtime()
     root = Path(__file__).resolve().parent
+    print('Версія бота: ' + (root / 'AI_VERSION').read_text(encoding='utf-8').strip(), flush=True)
     env = dependency_env()
     node, npm = prepare_node(root)
     env['PATH'] = str(node.parent) + os.pathsep + env.get('PATH', '')

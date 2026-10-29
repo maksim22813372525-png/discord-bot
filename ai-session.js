@@ -36,10 +36,19 @@ export class ConversationSession {
     this.closed = false;
     this.busy = false;
     this.pending = null;
+    this.receiveDiagnostics = new Map();
+    this.playbackUser = null;
     this.epoch = 0;
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.player.on('error', error => this.fail(error));
-    this.player.on(AudioPlayerStatus.Idle, () => this.drainPending());
+    this.player.on(AudioPlayerStatus.Idle, () => {
+      if (this.playbackUser) {
+        const user = this.playbackUser;
+        this.playbackUser = null;
+        if (this.receiveDiagnostics.get(user)?.stage === 'playing') this.note(user, 'completed');
+      }
+      this.drainPending();
+    });
     this.onSpeaking = user => this.capture(user);
   }
 
@@ -61,19 +70,60 @@ export class ConversationSession {
       && member.voice.channelId === this.channel.id;
   }
 
+  note(user, stage, values = {}, epoch = this.epoch) {
+    if (this.closed || epoch !== this.epoch) return;
+    const previous = this.receiveDiagnostics.get(user) || {
+      received_packets: 0, duration_ms: 0, capture_count: 0,
+    };
+    if (!Object.hasOwn(values, 'reason')) delete previous.reason;
+    this.receiveDiagnostics.delete(user);
+    this.receiveDiagnostics.set(user, { ...previous, ...values, stage });
+    // Counters contain no audio/text, and departed participants cannot grow
+    // the process state without a bound.
+    if (this.receiveDiagnostics.size > 100) this.receiveDiagnostics.delete(this.receiveDiagnostics.keys().next().value);
+  }
+
+  diagnostic(user) {
+    const member = this.guild.members.cache.get(user);
+    const ownVoice = this.guild.members.me?.voice;
+    return {
+      stage: 'none', received_packets: 0, duration_ms: 0, capture_count: 0,
+      ...this.receiveDiagnostics.get(user),
+      connection: this.connection?.state.status || 'not_connected',
+      player: this.player.state.status,
+      busy: this.busy,
+      same_channel: member?.voice.channelId === this.channel.id,
+      member_known: Boolean(member),
+      ignored: this.ignored.has(user),
+      self_deaf: Boolean(ownVoice?.selfDeaf),
+      server_deaf: Boolean(ownVoice?.serverDeaf),
+      self_mute: Boolean(ownVoice?.selfMute),
+      server_mute: Boolean(ownVoice?.serverMute),
+      user_muted: Boolean(member?.voice.selfMute || member?.voice.serverMute),
+    };
+  }
+
   capture(user) {
     // Start events are edge-triggered: dropping one while inference is busy
     // loses the whole ongoing utterance, even when inference later finishes.
-    if (!this.canListen(user) || this.player.state.status !== AudioPlayerStatus.Idle
-      || this.captures.has(user)) return;
+    if (!this.canListen(user) || this.captures.has(user)) return;
+    if (this.player.state.status !== AudioPlayerStatus.Idle) {
+      this.note(user, 'playback_blocked');
+      return;
+    }
     const stream = this.connection.receiver.subscribe(user, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
     });
     const decoder = new OpusScript(48000, 2, OpusScript.Application.VOIP);
     const chunks = [];
     let bytes = 0;
-    let speechFrames = 0;
+    let speechSamples = 0;
+    let decodedSamples = 0;
     let last = performance.now();
+    const epoch = this.epoch;
+    this.note(user, 'receiving', {
+      duration_ms: 0, capture_count: (this.receiveDiagnostics.get(user)?.capture_count || 0) + 1,
+    }, epoch);
     const capture = { done: false, timer: null, stream };
     const finish = save => {
       if (capture.done) return;
@@ -82,8 +132,11 @@ export class ConversationSession {
       this.captures.delete(user);
       stream.destroy();
       decoder.delete();
-      if (save && !this.closed && !this.ignored.has(user) && speechFrames >= 10) {
+      if (save && !this.closed && !this.ignored.has(user) && speechSamples >= 48_000 * 0.2) {
+        this.note(user, 'captured', { duration_ms: Math.round(decodedSamples / 48) }, epoch);
         this.respond(user, Buffer.concat(chunks));
+      } else if (save) {
+        this.note(user, 'too_short', { duration_ms: Math.round(decodedSamples / 48) }, epoch);
       }
     };
     capture.cancel = () => finish(false);
@@ -101,32 +154,55 @@ export class ConversationSession {
         last = now;
         const pcm = decoder.decode(packet);
         chunks.push(Buffer.from(pcm)); bytes += pcm.length;
-        if (!packet.equals(SILENCE)) speechFrames++;
+        const samples = pcm.length / 4;
+        decodedSamples += samples;
+        if (!packet.equals(SILENCE)) speechSamples += samples;
+        this.note(user, 'receiving', {
+          duration_ms: Math.round(decodedSamples / 48),
+          received_packets: (this.receiveDiagnostics.get(user)?.received_packets || 0) + 1,
+        }, epoch);
         if (bytes >= 48_000 * 2 * 2 * 20) finish(true);
-      } catch (error) { finish(false); this.onError(error); }
+      } catch (error) { finish(false); this.note(user, 'error', { reason: 'decode_failed' }, epoch); this.onError(error); }
     });
     stream.once('end', () => finish(true));
     stream.once('close', () => finish(false));
-    stream.once('error', error => { finish(false); this.onError(error); });
+    stream.once('error', error => { finish(false); this.note(user, 'error', { reason: 'receive_failed' }, epoch); this.onError(error); });
     capture.timer = setTimeout(() => finish(true), 20_000);
   }
 
-  async respond(user, pcm) {
+  async testVoice(user) {
+    if (!this.canListen(user)) throw new Error('Зайди в голосовой канал бота; /remember_me включает прослушивание тебя.');
+    if (this.busy || this.player.state.status !== AudioPlayerStatus.Idle) {
+      throw new Error('Дождись текущего ответа, затем повтори /talk_test.');
+    }
+    return this.respond(user, null, true);
+  }
+
+  async respond(user, pcm, testVoice = false) {
     if (!this.canListen(user)) return;
     if (this.busy || this.player.state.status !== AudioPlayerStatus.Idle) {
+      if (testVoice) return;
       // Keep just the latest complete utterance, not a backlog of old speech.
+      if (this.pending && this.pending.user !== user) this.note(this.pending.user, 'skipped', { reason: 'replaced_pending' });
       this.pending = { user, pcm: pcm.subarray(0, 3_840_000), epoch: this.epoch };
+      this.note(user, 'queued');
       return;
     }
     this.busy = true;
     const epoch = this.epoch;
+    this.note(user, 'requesting');
     const controller = this.request = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
     try {
-      const response = await this.worker.post('/reply', {
-        conversation: this.key, user, audio_pcm: pcm.subarray(0, 3_840_000).toString('base64'),
+      const response = await this.worker.post(testVoice ? '/test' : '/reply', {
+        conversation: this.key, user,
+        ...(testVoice ? {} : { audio_pcm: pcm.subarray(0, 3_840_000).toString('base64') }),
       }, controller.signal);
-      if (this.closed || epoch !== this.epoch || this.ignored.has(user) || response.skipped) return;
+      if (this.closed || epoch !== this.epoch || this.ignored.has(user)) return;
+      if (response.skipped) {
+        this.note(user, 'skipped', { reason: response.busy ? 'worker_busy' : 'not_recognized' }, epoch);
+        return false;
+      }
       if (response.sample_rate !== 48000 || response.channels !== 2 || typeof response.audio_pcm !== 'string') {
         throw new Error('Некоректна відповідь голосової моделі.');
       }
@@ -135,8 +211,12 @@ export class ConversationSession {
       // End any recording started while thinking before our own audio can
       // reach a participant's microphone. Its captured prefix can be pending.
       for (const capture of this.captures.values()) capture.finish();
+      this.playbackUser = user;
+      this.note(user, 'playing', {}, epoch);
       this.player.play(createAudioResource(Readable.from([audio]), { inputType: StreamType.Raw }));
+      return true;
     } catch (error) {
+      this.note(user, 'error', { reason: error.name === 'AbortError' ? 'request_timeout' : 'worker_failed' }, epoch);
       if (error.name !== 'AbortError' && !this.closed) this.onError(error);
     } finally {
       clearTimeout(timeout);
@@ -160,6 +240,8 @@ export class ConversationSession {
   async forget(user) {
     this.epoch++;
     this.pending = null;
+    this.receiveDiagnostics.clear();
+    this.playbackUser = null;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
     this.player.stop(true);
@@ -178,6 +260,8 @@ export class ConversationSession {
     this.closed = true;
     this.epoch++;
     this.pending = null;
+    this.receiveDiagnostics.clear();
+    this.playbackUser = null;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
     this.player.stop(true);

@@ -16,12 +16,14 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 import urllib.request
 from urllib.parse import urlsplit
 from ai_persona import SYSTEM_PROMPT, direct_reply
 
 MAX_REQUEST_BYTES = 6_000_000
 MAX_PCM_BYTES = 48_000 * 2 * 2 * 20
+VOICE_TEST_TEXT = 'Приветики! Я тут. Скажи мне что-нибудь.'
 
 
 class OllamaClient:
@@ -33,12 +35,25 @@ class OllamaClient:
         self.model = model
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    def warmup(self):
+        """Load the CPU model before the first Discord conversation turn."""
+        request = urllib.request.Request(self.url.removesuffix('/chat') + '/generate',
+            json.dumps({'model': self.model, 'prompt': '', 'stream': False, 'keep_alive': '10m',
+                        'options': {'num_gpu': 0, 'num_ctx': 3072}}).encode(),
+            {'Content-Type': 'application/json'})
+        with self.opener.open(request, timeout=180) as response:
+            data = json.load(response)
+        if data.get('error') or not data.get('done'):
+            raise RuntimeError('Ollama не підтвердила готовність мовної моделі.')
+
     def complete(self, messages):
         body = json.dumps({
             'model': self.model, 'messages': messages, 'stream': False, 'think': False,
-            'keep_alive': 0,
+            # Retain the CPU model in RAM between turns instead of reloading
+            # several GB for every reply. It expires after 10 idle minutes.
+            'keep_alive': '10m',
             # Keep the GPU available to speech synthesis on an 8 GB card.
-            'options': {'num_gpu': 0, 'num_ctx': 3072, 'num_predict': 90, 'temperature': 0.6},
+            'options': {'num_gpu': 0, 'num_ctx': 3072, 'num_predict': 64, 'temperature': 0.6},
         }).encode()
         request = urllib.request.Request(self.url, body, {'Content-Type': 'application/json'})
         with self.opener.open(request, timeout=180) as response:
@@ -48,7 +63,12 @@ class OllamaClient:
         text = re.sub(r'[*_`#]', '', text)
         if not text:
             raise RuntimeError('Ollama повернула порожню відповідь.')
-        return text[:500]
+        text = ' '.join(text.split())
+        if len(text) > 240:
+            short = text[:240]
+            sentence = max(short.rfind('.'), short.rfind('!'), short.rfind('?'))
+            text = short[:sentence + 1] if sentence >= 40 else short.rsplit(' ', 1)[0].rstrip(',;:') + '.'
+        return text
 
 
 class ConversationService:
@@ -74,7 +94,10 @@ class ConversationService:
 
     def diagnostic(self, conversation, user):
         with self.state_lock:
-            return dict(self.last_turns.get((conversation, user), {'status': 'none', 'heard': '', 'answer': ''}))
+            result = dict(self.last_turns.get((conversation, user), {'status': 'none', 'heard': '', 'answer': ''}))
+            if 'timings' in result:
+                result['timings'] = dict(result['timings'])
+            return result
 
     def _diagnose(self, conversation, user, version, **values):
         with self.state_lock:
@@ -91,8 +114,7 @@ class ConversationService:
                 self.blocked.discard((conversation, user))
 
     def reply(self, conversation, user, pcm):
-        if not conversation or not user or len(conversation) > 128 or len(user) > 64:
-            raise ValueError('Некоректний ідентифікатор розмови.')
+        self._validate_ids(conversation, user)
         if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 4:
             raise ValueError('Потрібне PCM stereo 48 кГц, до 20 секунд.')
         with self.state_lock:
@@ -107,34 +129,103 @@ class ConversationService:
         # One active inference, never a growing queue of stale voice messages.
         if not self.inference_lock.acquire(blocking=False):
             return {'skipped': True, 'busy': True}
+        heard, answer, language = '', '', {}
+        started = time.monotonic()
+        timings = {}
+        stage = 'recognizing'
         try:
             if cancelled():
                 return {'skipped': True}
+            self._diagnose(conversation, user, version, status=stage, heard='', answer='')
             heard = self.asr.transcribe(pcm).strip()
+            timings['recognizing'] = round(time.monotonic() - started, 2)
+            detected = getattr(self.asr, 'last_language', '')
+            if isinstance(detected, str) and re.fullmatch(r'[a-z]{2,3}', detected):
+                language = {'language': detected}
+            engine = getattr(self.asr, 'engine', '')
+            if isinstance(engine, str) and re.fullmatch(r'[a-z0-9-]{1,60}', engine):
+                language['engine'] = engine
             if not heard or cancelled():
+                reason = getattr(self.asr, 'last_reason', 'unintelligible')
+                if reason not in ('no_speech', 'too_short', 'unintelligible'):
+                    reason = 'unintelligible'
                 self._diagnose(conversation, user, version, status='skipped', heard='', answer='',
-                               reason=getattr(self.asr, 'last_reason', 'unintelligible'))
+                               reason=reason, **language)
                 return {'skipped': True}
-            self._diagnose(conversation, user, version, status='thinking', heard=heard, answer='')
+            stage = 'thinking'
+            self._diagnose(conversation, user, version, status=stage, heard=heard, answer='', **language)
             with self.state_lock:
                 previous = list(self.history.get(conversation, []))
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-            for _, question, answer in previous:
-                messages.extend([{'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer}])
+            for _, question, previous_answer in previous:
+                messages.extend([{'role': 'user', 'content': question}, {'role': 'assistant', 'content': previous_answer}])
             messages.append({'role': 'user', 'content': heard})
+            step_started = time.monotonic()
             answer = direct_reply(heard) or self.llm.complete(messages)
+            timings['thinking'] = round(time.monotonic() - step_started, 2)
             if cancelled():
                 return {'skipped': True}
+            stage = 'synthesizing'
+            self._diagnose(conversation, user, version, status=stage, heard=heard, answer=answer, **language)
+            step_started = time.monotonic()
             samples, rate = self.voice.synthesize(answer)
-            audio = self.to_pcm(samples, rate)
-            if len(audio) > MAX_PCM_BYTES * 2:
-                raise RuntimeError('Завелика голосова відповідь.')
+            result = self._audio_reply(samples, rate)
+            timings['synthesizing'] = round(time.monotonic() - step_started, 2)
             with self.state_lock:
                 if self.generation.get(conversation, 0) != version or (conversation, user) in self.blocked:
                     return {'skipped': True}
                 self.history.setdefault(conversation, deque(maxlen=6)).append((user, heard, answer))
-                self.last_turns[(conversation, user)] = {'status': 'answered', 'heard': heard, 'answer': answer}
-            return {'audio_pcm': base64.b64encode(audio).decode(), 'sample_rate': 48000, 'channels': 2}
+                self.last_turns[(conversation, user)] = {'status': 'answered', 'heard': heard, 'answer': answer,
+                                                        'timings': timings, **language}
+            print('Время ответа: ' + ', '.join(f'{name}={seconds:.2f}s' for name, seconds in timings.items()), flush=True)
+            return result
+        except Exception as error:
+            # Only a fixed stage and exception class are exposed, never exception
+            # text (which could contain a URL, credential or private transcript).
+            self._diagnose(conversation, user, version, status='failed', heard=heard,
+                           answer=answer, reason=stage, error_type=type(error).__name__, **language)
+            raise
+        finally:
+            self.inference_lock.release()
+
+    @staticmethod
+    def _validate_ids(conversation, user):
+        if (not isinstance(conversation, str) or not isinstance(user, str)
+                or not conversation or not user or len(conversation) > 128 or len(user) > 64):
+            raise ValueError('Некоректний ідентифікатор розмови.')
+
+    def _audio_reply(self, samples, rate):
+        audio = self.to_pcm(samples, rate)
+        if not audio or len(audio) % 4 or len(audio) > MAX_PCM_BYTES * 2:
+            raise RuntimeError('Некоректна або завелика голосова відповідь.')
+        return {'audio_pcm': base64.b64encode(audio).decode(), 'sample_rate': 48000, 'channels': 2}
+
+    def test_voice(self, conversation, user):
+        """Test the real speaker independently of ASR and the language model.
+
+        The fixed test line is not a conversation turn and must never overwrite
+        a participant's transcript, diagnostic, or conversation history.
+        """
+        self._validate_ids(conversation, user)
+        with self.state_lock:
+            version = self.generation.get(conversation, 0)
+            if (conversation, user) in self.blocked:
+                return {'skipped': True}
+
+        def cancelled():
+            with self.state_lock:
+                return self.generation.get(conversation, 0) != version or (conversation, user) in self.blocked
+
+        if not self.inference_lock.acquire(blocking=False):
+            return {'skipped': True, 'busy': True}
+        try:
+            if cancelled():
+                return {'skipped': True}
+            samples, rate = self.voice.synthesize(VOICE_TEST_TEXT)
+            result = self._audio_reply(samples, rate)
+            if cancelled():
+                return {'skipped': True}
+            return result
         finally:
             self.inference_lock.release()
 
@@ -194,6 +285,8 @@ def make_handler(service, token):
                 if self.path == '/reply':
                     pcm = base64.b64decode(data.get('audio_pcm', ''), validate=True)
                     result = service.reply(conversation, user, pcm)
+                elif self.path == '/test' and user:
+                    result = service.test_voice(conversation, user)
                 elif self.path == '/forget':
                     service.forget(conversation, user or None)
                     result = {'ok': True}
@@ -222,16 +315,22 @@ def main():
     reference = os.environ.get('VOICE_REFERENCE_PATH', '')
     if not token or not reference or not Path(reference).is_file():
         raise SystemExit('Запусти start_ai.bat і вибери локальний файл голосового зразка.')
-    from ai_asr import Asr
+    from ai_gpu_asr import create_asr
     from ai_tts import LocalVoice
     data = Path(os.getenv('BOT_DATA_DIR', Path(__file__).resolve().parent / 'data'))
     os.environ.setdefault('HF_HOME', str(data / 'models' / 'huggingface'))
     print('Завантажую локальне розпізнавання…', flush=True)
-    asr = Asr(data / 'models')
+    asr = create_asr(data / 'models')
     asr._load()
+    print('Распознавание: ' + asr.engine, flush=True)
     print('Завантажую голосову модель. Перший запуск потребує завантаження ваг…', flush=True)
     voice = LocalVoice(reference, device=os.getenv('VOICE_DEVICE', 'cuda:0'))
-    service = ConversationService(asr, voice, OllamaClient())
+    print('Готовлю короткое приветствие. При разговоре оно будет звучать из памяти…', flush=True)
+    voice.warmup()
+    print('Прогреваю языковую модель перед первым разговором…', flush=True)
+    llm = OllamaClient()
+    llm.warmup()
+    service = ConversationService(asr, voice, llm)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(service, token))
     server.daemon_threads = True
     print(f'AI_WORKER_READY http://127.0.0.1:{server.server_address[1]}', flush=True)

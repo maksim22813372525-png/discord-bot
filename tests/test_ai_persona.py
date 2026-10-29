@@ -31,6 +31,14 @@ class PersonaTests(unittest.TestCase):
                      'прекрасно', 'алгебра', '', '...'):
             self.assertIsNone(direct_reply(text), text)
 
+    def test_ukrainian_and_english_are_understood_without_stripping_ukrainian_letters(self):
+        for text in ('Привіт!', 'Альтушечка, привітик', 'Hi!', 'Hello', 'Няшка, ти тут?',
+                     'Hey, Luna!', 'Altushka', 'Альтушечко'):
+            self.assertIsNotNone(direct_reply(text), text)
+        for text in ('How are you?', 'Альтушка, як справи?', 'Луна, I won раунд', 'привітання'):
+            self.assertIsNone(direct_reply(text), text)
+        self.assertIn('украинский, английский', SYSTEM_PROMPT)
+
     def test_persona_declares_voice_only_input_and_examples_are_labelled(self):
         self.assertIn('Текстовый чат', SYSTEM_PROMPT)
         self.assertIn('не события текущего разговора', SYSTEM_PROMPT)

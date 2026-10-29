@@ -1,15 +1,17 @@
 import base64
 import http.client
+import io
 import json
+import math
 from pathlib import Path
 import sys
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from http.server import ThreadingHTTPServer
-from ai_worker import ConversationService, OllamaClient, make_handler, audio_to_pcm
+from ai_worker import ConversationService, OllamaClient, make_handler, audio_to_pcm, VOICE_TEST_TEXT
 
 
 class FakeAsr:
@@ -35,7 +37,210 @@ def service(llm=None):
     return ConversationService(FakeAsr(), FakeVoice(), llm or FakeLlm(), to_pcm=lambda a, r: b'\0' * 3840)
 
 
+class OllamaLatencyTests(unittest.TestCase):
+    @staticmethod
+    def client_with_reply(text):
+        client = OllamaClient()
+        client.opener.open = Mock(side_effect=lambda *args, **kwargs:
+                                  io.BytesIO(json.dumps({'message': {'content': text}}).encode()))
+        return client
+
+    def test_real_chat_request_retains_cpu_model_and_disables_thinking(self):
+        client = self.client_with_reply('О, хорош!')
+        messages = [{'role': 'system', 'content': 'Коротко.'},
+                    {'role': 'user', 'content': 'I won the round.'}]
+        self.assertEqual(client.complete(messages), 'О, хорош!')
+        request = client.opener.open.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(request.full_url, 'http://127.0.0.1:11434/api/chat')
+        self.assertEqual(payload['messages'], messages)
+        self.assertEqual(payload['model'], 'qwen3:4b')
+        self.assertEqual(payload['keep_alive'], '10m')
+        self.assertIs(payload['think'], False)
+        self.assertEqual(payload['options']['num_gpu'], 0)
+        self.assertEqual(payload['options']['num_predict'], 64)
+
+    def test_speech_reply_removes_reasoning_and_normalizes_whitespace(self):
+        client = self.client_with_reply('<think>Private internal reasoning.</think>\n**О, привет!**\n  Как   дела?')
+        self.assertEqual(client.complete([]), 'О, привет! Как дела?')
+
+    def test_long_spoken_reply_ends_at_a_complete_sentence(self):
+        first = 'Ого, хорош, ты этот раунд очень красиво забрал!'
+        client = self.client_with_reply(first + ' ' + 'Сейчас я расскажу длинную историю без остановки ' * 20)
+        result = client.complete([])
+        self.assertEqual(result, first)
+        self.assertLessEqual(len(result), 240)
+
+    def test_long_reply_without_sentence_break_keeps_whole_words(self):
+        client = self.client_with_reply('слово ' * 100)
+        result = client.complete([])
+        self.assertLessEqual(len(result), 240)
+        self.assertRegex(result, r'^(?:слово )*слово\.$')
+
+
 class WorkerTests(unittest.TestCase):
+    def assert_timings(self, timings):
+        self.assertEqual(set(timings), {'recognizing', 'thinking', 'synthesizing'})
+        for seconds in timings.values():
+            self.assertIsInstance(seconds, (int, float))
+            self.assertTrue(math.isfinite(seconds))
+            self.assertGreaterEqual(seconds, 0)
+
+    def test_timing_diagnostic_measures_actual_pipeline_stages(self):
+        worker = service()
+        with patch('ai_worker.time.monotonic', side_effect=[0, 0.45, 0.5, 1.75, 1.8, 4.3]):
+            worker.reply('g:c', 'u', b'\0' * 3840)
+        self.assertEqual(worker.diagnostic('g:c', 'u')['timings'], {
+            'recognizing': 0.45, 'thinking': 1.25, 'synthesizing': 2.5,
+        })
+
+    def test_live_diagnostic_tracks_recognition_thinking_and_synthesis(self):
+        entered = {stage: threading.Event() for stage in ('recognizing', 'thinking', 'synthesizing')}
+        release = {stage: threading.Event() for stage in entered}
+
+        def wait(stage, result):
+            entered[stage].set()
+            if not release[stage].wait(5):
+                raise RuntimeError('Test stage was never released')
+            return result
+
+        asr = Mock(last_language='uk')
+        asr.transcribe.side_effect = lambda pcm: wait('recognizing', 'Як справи?')
+        llm = Mock()
+        llm.complete.side_effect = lambda messages: wait('thinking', 'Теперь повеселее.')
+        voice = Mock()
+        voice.synthesize.side_effect = lambda text: wait('synthesizing', ([0.1, -0.1], 24000))
+        worker = ConversationService(asr, voice, llm, to_pcm=lambda a, r: b'\0' * 3840)
+        results, errors = [], []
+
+        def run():
+            try:
+                results.append(worker.reply('g:c', 'u', b'\0' * 3840))
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            for stage in entered:
+                self.assertTrue(entered[stage].wait(2), stage)
+                diagnostic = worker.diagnostic('g:c', 'u')
+                self.assertEqual(diagnostic['status'], stage)
+                if stage == 'recognizing':
+                    self.assertEqual(diagnostic['heard'], '')
+                else:
+                    self.assertEqual(diagnostic['heard'], 'Як справи?')
+                    self.assertEqual(diagnostic['language'], 'uk')
+                if stage == 'synthesizing':
+                    self.assertEqual(diagnostic['answer'], 'Теперь повеселее.')
+                self.assertEqual(worker.diagnostic('g:c', 'other')['status'], 'none')
+                release[stage].set()
+        finally:
+            for event in release.values():
+                event.set()
+            thread.join(3)
+        self.assertEqual(errors, [])
+        self.assertIn('audio_pcm', results[0])
+        diagnostic = worker.diagnostic('g:c', 'u')
+        self.assert_timings(diagnostic.pop('timings'))
+        self.assertEqual(diagnostic, {
+            'status': 'answered', 'heard': 'Як справи?', 'answer': 'Теперь повеселее.', 'language': 'uk',
+        })
+
+    def test_failures_report_the_failed_stage_without_exception_text(self):
+        for stage in ('recognizing', 'thinking', 'synthesizing'):
+            with self.subTest(stage=stage):
+                asr = Mock(last_language='en')
+                asr.transcribe.return_value = 'How are you?'
+                voice = Mock()
+                voice.synthesize.return_value = ([0.1, -0.1], 24000)
+                llm = Mock()
+                llm.complete.return_value = 'У меня всё хорошо.'
+                method = {'recognizing': asr.transcribe, 'thinking': llm.complete,
+                          'synthesizing': voice.synthesize}[stage]
+                method.side_effect = RuntimeError('private-token-and-error-detail')
+                worker = ConversationService(asr, voice, llm, to_pcm=lambda a, r: b'\0' * 3840)
+                with self.assertRaises(RuntimeError):
+                    worker.reply('g:c', 'u', b'\0' * 3840)
+                diagnostic = worker.diagnostic('g:c', 'u')
+                self.assertEqual(diagnostic['status'], 'failed')
+                self.assertEqual(diagnostic['reason'], stage)
+                self.assertEqual(diagnostic['error_type'], 'RuntimeError')
+                self.assertNotIn('private-token', json.dumps(diagnostic))
+                if stage == 'recognizing':
+                    self.assertEqual(diagnostic['heard'], '')
+                else:
+                    self.assertEqual(diagnostic['heard'], 'How are you?')
+                    self.assertEqual(diagnostic['language'], 'en')
+                if stage == 'synthesizing':
+                    self.assertEqual(diagnostic['answer'], 'У меня всё хорошо.')
+                self.assertFalse(worker.inference_lock.locked())
+                self.assertEqual(worker.history, {})
+
+    def test_voice_test_bypasses_asr_and_llm_and_preserves_actual_turns(self):
+        worker = service()
+        worker.reply('g:c', 'u', b'\0' * 3840)
+        history = list(worker.history['g:c'])
+        diagnostic = worker.diagnostic('g:c', 'u')
+        worker.asr, worker.llm = Mock(), Mock()
+        worker.voice = Mock()
+        worker.voice.synthesize.return_value = ([0.1, -0.1], 24000)
+        result = worker.test_voice('g:c', 'u')
+        self.assertEqual(len(base64.b64decode(result['audio_pcm'])), 3840)
+        worker.asr.transcribe.assert_not_called()
+        worker.llm.complete.assert_not_called()
+        worker.voice.synthesize.assert_called_once_with(VOICE_TEST_TEXT)
+        self.assertEqual(list(worker.history['g:c']), history)
+        self.assertEqual(worker.diagnostic('g:c', 'u'), diagnostic)
+        worker.test_voice('g:new', 'other')
+        self.assertNotIn('g:new', worker.history)
+        self.assertEqual(worker.diagnostic('g:new', 'other')['status'], 'none')
+
+    def test_voice_test_respects_shared_lock_blocks_and_cancellation(self):
+        worker = service()
+        worker.inference_lock.acquire()
+        try:
+            self.assertEqual(worker.test_voice('g:c', 'u'), {'skipped': True, 'busy': True})
+        finally:
+            worker.inference_lock.release()
+        entered, release = threading.Event(), threading.Event()
+
+        def synthesize(text):
+            entered.set()
+            release.wait(3)
+            return [0.1, -0.1], 24000
+
+        worker.voice = Mock()
+        worker.voice.synthesize.side_effect = synthesize
+        results = []
+        thread = threading.Thread(target=lambda: results.append(worker.test_voice('g:c', 'u')))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(worker.reply('g:c', 'other', b'\0' * 3840), {'skipped': True, 'busy': True})
+            worker.forget('g:c', 'u')
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertEqual(results, [{'skipped': True}])
+        self.assertEqual(worker.test_voice('g:c', 'u'), {'skipped': True})
+        self.assertEqual(worker.voice.synthesize.call_count, 1)
+        self.assertEqual(worker.history, {})
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
+        self.assertFalse(worker.inference_lock.locked())
+
+    def test_voice_test_releases_lock_after_synthesis_error_and_validates_ids(self):
+        worker = service()
+        worker.voice = Mock()
+        worker.voice.synthesize.side_effect = RuntimeError('private-error')
+        with self.assertRaises(RuntimeError):
+            worker.test_voice('g:c', 'u')
+        self.assertFalse(worker.inference_lock.locked())
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
+        for conversation, user in (('', 'u'), ('g:c', ''), ('g' * 129, 'u'), ('g:c', 'u' * 65)):
+            with self.assertRaises(ValueError):
+                worker.test_voice(conversation, user)
+
     def test_greetings_and_aliases_bypass_llm_but_speak_and_record_actual_turns(self):
         for heard in ('привет', 'Приветики!', 'пр', 'Няшка', 'Альтушка', 'Альтушечка', 'Тянка'):
             with self.subTest(heard=heard):
@@ -52,8 +257,9 @@ class WorkerTests(unittest.TestCase):
                 answer = voice.synthesize.call_args.args[0]
                 self.assertTrue(answer)
                 self.assertEqual(list(worker.history['g:c']), [('u', heard, answer)])
-                self.assertEqual(worker.diagnostic('g:c', 'u'),
-                                 {'status': 'answered', 'heard': heard, 'answer': answer})
+                diagnostic = worker.diagnostic('g:c', 'u')
+                self.assert_timings(diagnostic.pop('timings'))
+                self.assertEqual(diagnostic, {'status': 'answered', 'heard': heard, 'answer': answer})
 
     def test_no_speech_does_not_create_a_reply_or_conversation_turn(self):
         for reason in ('no_speech', 'too_short', 'unintelligible'):
@@ -92,7 +298,9 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostic('g:other', 'u')['status'], 'none')
         diagnostic = worker.diagnostic('g:c', 'u')
         diagnostic['heard'] = 'changed outside service'
+        diagnostic['timings']['recognizing'] = 999
         self.assertEqual(worker.diagnostic('g:c', 'u')['heard'], 'Привет, как дела?')
+        self.assertNotEqual(worker.diagnostic('g:c', 'u')['timings']['recognizing'], 999)
         worker.forget('g:c', 'u')
         self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
         self.assertEqual(worker.diagnostic('g:c', 'other')['status'], 'none')
@@ -212,6 +420,7 @@ class WorkerTests(unittest.TestCase):
         data = {'conversation': 'g:c', 'user': 'u', 'audio_pcm': base64.b64encode(b'\0' * 3840).decode()}
         self.assertEqual(request('/reply', data, 'wrong')[0], 401)
         self.assertEqual(request('/last', data, 'wrong')[0], 401)
+        self.assertEqual(request('/test', data, 'wrong')[0], 401)
         self.assertEqual(worker.history, {})
         self.assertEqual(request('/last', data)[1]['status'], 'none')
         status, reply = request('/reply', data)
@@ -220,8 +429,15 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(reply['channels'], 2)
         status, diagnostic = request('/last', data)
         self.assertEqual(status, 200)
-        self.assertEqual(diagnostic, {'status': 'answered', 'heard': 'Привет, как дела?',
-                                      'answer': 'Привет! Отлично, а у тебя?'})
+        contents = dict(diagnostic)
+        self.assert_timings(contents.pop('timings'))
+        self.assertEqual(contents, {'status': 'answered', 'heard': 'Привет, как дела?',
+                                    'answer': 'Привет! Отлично, а у тебя?'})
+        history = list(worker.history['g:c'])
+        self.assertEqual(request('/test', {'conversation': 'g:c', 'user': 'u'})[1]['sample_rate'], 48000)
+        self.assertEqual(list(worker.history['g:c']), history)
+        self.assertEqual(request('/last', data)[1], diagnostic)
+        self.assertEqual(request('/test', {'conversation': 'g:c', 'user': ''})[0], 404)
         self.assertEqual(request('/last', dict(data, user='other'))[1]['status'], 'none')
         self.assertEqual(request('/last', dict(data, conversation='g:other'))[1]['status'], 'none')
         self.assertEqual(request('/last', dict(data, user=''))[0], 404)

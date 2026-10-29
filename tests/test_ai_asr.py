@@ -171,8 +171,8 @@ class AudioTests(unittest.TestCase):
         aliased = ai_asr._pcm_to_samples(self.tone(17000))
         self.assertLess(float(np.sqrt(np.mean(aliased ** 2))), 0.005)
 
-    def test_sherpa_receives_correct_language_and_reuses_the_model(self):
-        stream = types.SimpleNamespace(result=types.SimpleNamespace(text='  Привет,\nкак дела? '),
+    def test_sherpa_autodetects_language_and_reuses_the_model(self):
+        stream = types.SimpleNamespace(result=types.SimpleNamespace(text='  Привет,\nкак дела? ', lang='ru'),
                                        accept_waveform=Mock())
         recognizer = types.SimpleNamespace(create_stream=Mock(return_value=stream), decode_stream=Mock())
         factory = Mock(return_value=recognizer)
@@ -185,13 +185,56 @@ class AudioTests(unittest.TestCase):
                     self.assertEqual(engine.transcribe(self.tone()), 'Привет, как дела?')
                     self.assertEqual(engine.transcribe(self.tone()), 'Привет, как дела?')
                     self.assertEqual(engine.last_reason, 'recognized')
+                    self.assertEqual(engine.last_language, 'ru')
         self.assertEqual(factory.call_count, 1)
         self.assertEqual(models.call_count, 1)
-        self.assertEqual(factory.call_args.kwargs['language'], 'ru')
+        self.assertEqual(factory.call_args.kwargs['language'], '')
         self.assertEqual(factory.call_args.kwargs['provider'], 'cpu')
         self.assertEqual(factory.call_args.kwargs['task'], 'transcribe')
         self.assertEqual(stream.accept_waveform.call_args.args[0], 16000)
         self.assertEqual(recognizer.decode_stream.call_count, 2)
+
+    def test_language_overrides_are_validated_and_passed_to_sherpa(self):
+        for language in ('auto', 'ru', 'uk', 'en'):
+            factory = Mock()
+            sherpa = types.SimpleNamespace(OfflineRecognizer=types.SimpleNamespace(from_whisper=factory))
+            with self.subTest(language=language), patch.dict('os.environ', {'ASR_LANGUAGE': language}):
+                engine = ai_asr.Asr('/models')
+                with patch('ai_asr._ensure_models', return_value=Path('/models/base')):
+                    with patch.object(engine, '_load_vad'), patch.dict(sys.modules, {'sherpa_onnx': sherpa}):
+                        engine._load()
+                self.assertEqual(factory.call_args.kwargs['language'], '' if language == 'auto' else language)
+        with patch.dict('os.environ', {'ASR_LANGUAGE': 'ru'}):
+            self.assertEqual(ai_asr.Asr('/models', language='uk').language, 'uk')
+        for invalid in ('xx', 'automatic', '', None, 123):
+            with self.subTest(invalid=invalid):
+                if invalid is None:
+                    with patch.dict('os.environ', {'ASR_LANGUAGE': 'xx'}), self.assertRaises(ValueError):
+                        ai_asr.Asr('/models')
+                else:
+                    with self.assertRaises(ValueError):
+                        ai_asr.Asr('/models', language=invalid)
+
+    def test_multilingual_and_mixed_transcripts_are_preserved_without_guessing_language(self):
+        result = types.SimpleNamespace(text='', lang='')
+        stream = types.SimpleNamespace(result=result, accept_waveform=Mock())
+        recognizer = types.SimpleNamespace(create_stream=lambda: stream, decode_stream=Mock())
+        engine = ai_asr.Asr('/unused')
+        with patch.object(engine, '_speech_samples', side_effect=lambda x: x), patch.object(engine, '_load', return_value=recognizer):
+            for text, language in [('Hello, how are you?', 'en'), ('Привіт, як справи?', 'uk'),
+                                   ('Привет, how are you? Як справи?', 'ru')]:
+                with self.subTest(text=text):
+                    result.text, result.lang = text, language
+                    self.assertEqual(engine.transcribe(self.tone()), text)
+                    self.assertEqual(engine.last_language, language)
+            del result.lang
+            self.assertTrue(engine.transcribe(self.tone()))
+            self.assertEqual(engine.last_language, '')
+            result.lang = 'en'
+            self.assertTrue(engine.transcribe(self.tone()))
+            self.assertEqual(engine.last_language, 'en')
+            self.assertEqual(engine.transcribe(b'\0' * 48000 * 4), '')
+            self.assertEqual(engine.last_language, '')
 
     def test_vad_rejects_non_speech_before_whisper_can_invent_words(self):
         engine = ai_asr.Asr('/unused')

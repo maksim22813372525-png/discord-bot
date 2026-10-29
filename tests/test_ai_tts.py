@@ -116,6 +116,56 @@ class LocalVoiceTests(unittest.TestCase):
         ai_tts.LocalVoice("local-only.wav", device="cpu")
         self.assertIs(self.loader.from_pretrained.call_args.kwargs["dtype"], self.torch.float32)
 
+    def test_fixed_greetings_are_reused_and_caller_mutations_cannot_change_cached_audio(self):
+        voice = ai_tts.LocalVoice("local-only.wav")
+        first, rate = voice.synthesize("Приветики!")
+        original = first.copy()
+        first[:] = 0
+        second, second_rate = voice.synthesize("Приветики!")
+        np.testing.assert_array_equal(second, original)
+        second[:] = 0
+        third, _ = voice.synthesize("Приветики!")
+        np.testing.assert_array_equal(third, original)
+        self.assertEqual(rate, second_rate)
+        self.model.generate_voice_clone.assert_called_once()
+
+    def test_arbitrary_private_replies_are_never_cached(self):
+        voice = ai_tts.LocalVoice("local-only.wav")
+        for _ in range(2):
+            voice.synthesize("Приветики! Ты говорил, что тебя зовут Маша.")
+        self.assertEqual(self.model.generate_voice_clone.call_count, 2)
+        self.assertEqual(voice._static_cache, {})
+
+    def test_static_cache_is_separate_for_each_voice_instance(self):
+        first = ai_tts.LocalVoice("reference-one.wav")
+        second = ai_tts.LocalVoice("reference-two.wav")
+        first.synthesize("Приветики!")
+        second.synthesize("Приветики!")
+        first.synthesize("Приветики!")
+        self.assertEqual(self.model.generate_voice_clone.call_count, 2)
+
+    def test_warmup_is_explicit_and_generates_two_reusable_social_replies(self):
+        voice = ai_tts.LocalVoice("local-only.wav")
+        self.model.generate_voice_clone.assert_not_called()
+        voice.warmup()
+        voice.warmup()
+        voice.synthesize("Приветики!")
+        voice.synthesize("М? Я тут.")
+        self.assertEqual(self.model.generate_voice_clone.call_count, 2)
+        self.assertEqual({call.kwargs["text"] for call in self.model.generate_voice_clone.call_args_list},
+                         {"Приветики!", "М? Я тут."})
+
+    def test_static_cache_has_fixed_keys_and_does_not_store_oversized_audio(self):
+        voice = ai_tts.LocalVoice("local-only.wav")
+        for text in ai_tts.STATIC_VOICE_REPLIES:
+            voice.synthesize(text)
+        self.assertEqual(set(voice._static_cache), ai_tts.STATIC_VOICE_REPLIES)
+        self.assertEqual(len(voice._static_cache), 7)
+        self.model.generate_voice_clone.return_value = ([np.zeros(24_000 * 41, dtype=np.float32)], 24_000)
+        another = ai_tts.LocalVoice("local-only.wav")
+        another.synthesize("Приветики!")
+        self.assertEqual(another._static_cache, {})
+
     def test_missing_cuda_does_not_silently_run_slow_cpu_model(self):
         self.torch.cuda.is_available = lambda: False
         with self.assertRaisesRegex(RuntimeError, "CUDA"):

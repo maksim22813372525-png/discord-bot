@@ -18,6 +18,14 @@ MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 REFERENCE_SAMPLE_RATE = 24_000
 MIN_REFERENCE_SECONDS = 3
 MAX_REFERENCE_SECONDS = 60
+# Only fixed, non-personal lines may outlive a conversation reset in this
+# per-voice cache. Arbitrary replies are deliberately never retained here.
+STATIC_VOICE_REPLIES = frozenset((
+    "Приветики!", "О, привет!", "Привет-привет!",
+    "М? Я тут.", "А? Слушаю.", "Да-да, я здесь.",
+    "Приветики! Я тут. Скажи мне что-нибудь.",
+))
+STATIC_CACHE_MAX_SECONDS = 40
 
 
 def _seconds(name: str, default: float, *, minimum: float, maximum: float) -> float:
@@ -100,6 +108,7 @@ class LocalVoice:
         dtype = torch.float32 if device == "cpu" else torch.bfloat16
         self._torch = torch
         self._lock = threading.Lock()
+        self._static_cache = {}
         self._model = Qwen3TTSModel.from_pretrained(
             MODEL_ID, device_map=device, dtype=dtype, attn_implementation="sdpa",
         )
@@ -110,6 +119,11 @@ class LocalVoice:
                 ref_audio=(audio, sample_rate), x_vector_only_mode=True,
             )
 
+    def warmup(self):
+        """Prepare the two fixed social replies before joining Discord."""
+        self.synthesize("Приветики!")
+        self.synthesize("М? Я тут.")
+
     def synthesize(self, text):
         """Return ``(mono_float32_waveform, sample_rate)`` for one Russian turn."""
         import numpy as np
@@ -119,22 +133,29 @@ class LocalVoice:
         text = text.strip()
         if len(text) > 1000:
             raise ValueError("Одна голосова відповідь має містити не більше 1000 символів.")
-        with self._lock, self._torch.inference_mode():
-            waves, sample_rate = self._model.generate_voice_clone(
-                text=text, language="Russian", voice_clone_prompt=self._prompt,
-                max_new_tokens=1024,
-            )
-        if not waves:
-            raise RuntimeError("Голосова модель не повернула аудіо.")
-        audio = np.asarray(waves[0], dtype=np.float32).squeeze()
-        if audio.ndim == 2:
-            if audio.shape[1] <= 2:
-                audio = audio.mean(axis=1)
-            elif audio.shape[0] <= 2:
-                audio = audio.mean(axis=0)
-        if audio.ndim != 1 or not audio.size or not np.isfinite(audio).all():
-            raise RuntimeError("Голосова модель повернула некоректне аудіо.")
-        sample_rate = int(sample_rate)
-        if sample_rate <= 0:
-            raise RuntimeError("Голосова модель повернула некоректну частоту аудіо.")
-        return np.ascontiguousarray(audio, dtype=np.float32), sample_rate
+        with self._lock:
+            if text in self._static_cache:
+                audio, sample_rate = self._static_cache[text]
+                return audio.copy(), sample_rate
+            with self._torch.inference_mode():
+                waves, sample_rate = self._model.generate_voice_clone(
+                    text=text, language="Russian", voice_clone_prompt=self._prompt,
+                    max_new_tokens=1024,
+                )
+            if not waves:
+                raise RuntimeError("Голосова модель не повернула аудіо.")
+            audio = np.asarray(waves[0], dtype=np.float32).squeeze()
+            if audio.ndim == 2:
+                if audio.shape[1] <= 2:
+                    audio = audio.mean(axis=1)
+                elif audio.shape[0] <= 2:
+                    audio = audio.mean(axis=0)
+            if audio.ndim != 1 or not audio.size or not np.isfinite(audio).all():
+                raise RuntimeError("Голосова модель повернула некоректне аудіо.")
+            sample_rate = int(sample_rate)
+            if sample_rate <= 0:
+                raise RuntimeError("Голосова модель повернула некоректну частоту аудіо.")
+            audio = np.ascontiguousarray(audio, dtype=np.float32)
+            if text in STATIC_VOICE_REPLIES and audio.size <= sample_rate * STATIC_CACHE_MAX_SECONDS:
+                self._static_cache[text] = (audio.copy(), sample_rate)
+            return audio, sample_rate

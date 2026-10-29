@@ -3,6 +3,10 @@ import { ClipStore } from './clips.js';
 import { ConversationSession, LocalWorker } from './ai-session.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { formatDiagnostic } from './ai-status.js';
+
+const version = readFileSync(new URL('./AI_VERSION', import.meta.url), 'utf8').trim();
 
 const restrict = PermissionFlagsBits.ManageGuild;
 export const definitions = [
@@ -10,12 +14,19 @@ export const definitions = [
   ['talk_off', 'Зупинити розмову та вийти з войсу', true],
   ['talk_clear', 'Очистити пам’ять поточної розмови', true],
   ['talk_heard', 'Приватно показати, як бот розпізнав твою останню репліку'],
+  ['talk_test', 'Перевірити голос бота без розпізнавання мікрофона'],
   ['forget_me', 'Не слухати мене та видалити мої репліки з пам’яті'],
   ['remember_me', 'Знову слухати мої репліки'],
 ].map(([name, description, admin]) => {
   const c = new SlashCommandBuilder().setName(name).setDescription(description).setDMPermission(false);
   return (admin ? c.setDefaultMemberPermissions(restrict) : c).toJSON();
 });
+
+export async function registerCommands(client) {
+  await client.application.commands.set(definitions);
+  // Server commands become available without waiting for the global cache.
+  for (const guild of client.guilds.cache.values()) await guild.commands.set(definitions);
+}
 
 export async function main() {
   const token = process.env.DISCORD_TOKEN;
@@ -26,9 +37,12 @@ export async function main() {
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates], allowedMentions: { parse: [] } });
   client.once(Events.ClientReady, async ready => {
     try {
-      await ready.application.commands.set(definitions);
-      console.log(`Онлайн: ${ready.user.tag}. Зайди у войс та виконай /talk_on.`);
+      await registerCommands(ready);
+      console.log(`Онлайн: ${ready.user.tag}. Версия: ${version}. /talk_on — разговор, /talk_test — проверка голоса, /talk_heard — что услышала.`);
     } catch (error) { console.error('Команди:', error.message); client.destroy(); process.exitCode = 1; }
+  });
+  client.on(Events.GuildCreate, guild => {
+    guild.commands.set(definitions).catch(error => console.error('Обновление команд сервера:', error.message));
   });
   client.on(Events.InteractionCreate, async i => {
     if (!i.isChatInputCommand() || !i.inGuild()) return;
@@ -40,7 +54,7 @@ export async function main() {
       if (['talk_on', 'talk_off', 'talk_clear'].includes(name) && !i.memberPermissions?.has(restrict)) {
         await i.reply({ content: 'Потрібне право «Керування сервером».', ephemeral: true }); return;
       }
-      await i.deferReply({ ephemeral: ['forget_me', 'remember_me', 'talk_heard'].includes(name) });
+      await i.deferReply({ ephemeral: ['forget_me', 'remember_me', 'talk_heard', 'talk_test'].includes(name) });
       let session = sessions.get(i.guildId);
       if (name === 'talk_on') {
         if (session) { await i.editReply('Розмова вже ввімкнена. Спочатку /talk_off.'); return; }
@@ -51,7 +65,7 @@ export async function main() {
         if (!channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
           await i.editReply('Боту потрібні права «Дивитися канали», «Приєднуватися» та «Говорити».'); return;
         }
-        await i.editReply(`🎙️ У <#${channel.id}> починається розмова з локальною AI-співрозмовницею російською. Репліки розпізнаються на ПК власника; історія живе лише в пам’яті процесу. /forget_me — не слухати тебе, /talk_off — зупинити. Говоріть по черзі; відповідь буде після паузи.`);
+        await i.editReply(`🎙️ У <#${channel.id}> починається розмова. Розпізнаються російська, українська й англійська; відповіді російською. Репліки обробляються на ПК власника, історія лише в пам’яті. /forget_me — не слухати тебе, /talk_off — зупинити. Після входу перевір голос через /talk_test, а розпізнавання — через /talk_heard.`);
         if (sessions.has(i.guildId)) { await i.editReply('Розмову вже запустив інший учасник.'); return; }
         const ignored = new Set(store.data.ignored.filter(s => s.startsWith(i.guildId + ':')).map(s => s.split(':')[1]));
         session = new ConversationSession({ channel, worker, ignored,
@@ -73,9 +87,18 @@ export async function main() {
       } else if (name === 'talk_heard') {
         if (!session) { await i.editReply('Сначала включи разговор через /talk_on.'); return; }
         const last = await worker.post('/last', { conversation: session.key, user: i.user.id });
-        if (last.status === 'none') await i.editReply('Твоих распознанных реплик пока нет. Скажи фразу после запуска /talk_on.');
-        else if (last.status === 'skipped') await i.editReply('В последнем фрагменте речь не распознана. Попробуй сказать фразу чётче и проверить уровень микрофона.');
-        else await i.editReply(`Услышала: «${String(last.heard || '').slice(0, 700)}»\n${last.answer ? `Ответ: «${String(last.answer).slice(0, 600)}»` : 'Ответ ещё готовится.'}`);
+        await i.editReply(formatDiagnostic(version, session.diagnostic(i.user.id), last));
+      } else if (name === 'talk_test') {
+        if (!session) { await i.editReply('Сначала включи разговор через /talk_on.'); return; }
+        const member = await i.guild.members.fetch(i.user.id);
+        if (member.voice.channelId !== session.channel.id || session.ignored.has(i.user.id)) {
+          await i.editReply('Зайди в голосовой канал бота. Если выключал прослушивание себя, введи /remember_me.'); return;
+        }
+        if (session.busy || session.player.state.status !== 'idle') {
+          await i.editReply('Дождись текущего ответа и повтори /talk_test.'); return;
+        }
+        const played = await session.testVoice(i.user.id);
+        await i.editReply(played ? 'Проверочная фраза отправлена в войс. Теперь скажи что-нибудь и проверь /talk_heard.' : 'Проверка голоса не завершилась. Посмотри окно бота и повтори команду.');
       } else if (name === 'forget_me') {
         store.ignore(i.guildId, i.user.id);
         if (session) await session.forget(i.user.id);

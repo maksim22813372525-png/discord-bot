@@ -1,4 +1,4 @@
-"""Offline Russian speech-gated Whisper ASR for 48 kHz stereo s16le PCM.
+"""Offline multilingual speech-gated Whisper ASR for 48 kHz stereo s16le PCM.
 
 The official multilingual base model is downloaded once and checksum verified.
 No audio or transcript is sent to a remote recognition service.
@@ -202,11 +202,19 @@ def _clean_transcript(text: str) -> str:
 
 
 class Asr:
-    def __init__(self, models_dir):
+    def __init__(self, models_dir, language=None):
+        language = os.getenv('ASR_LANGUAGE', 'auto') if language is None else language
+        if not isinstance(language, str) or language.strip().casefold() not in ('auto', 'ru', 'uk', 'en'):
+            raise ValueError('ASR_LANGUAGE must be auto, ru, uk, or en.')
+        language = language.strip().casefold()
+        # Sherpa enables Whisper language detection with an empty string;
+        # the literal string "auto" is not a language token.
+        self.language = '' if language == 'auto' else language
         self.models_dir = Path(models_dir)
         self._recognizer = None
         self._vad = None
         self.last_reason = 'no_speech'
+        self.last_language = ''
 
     def _load_vad(self):
         if self._vad is None:
@@ -264,7 +272,7 @@ class Asr:
                 encoder=str(directory / 'base-encoder.int8.onnx'),
                 decoder=str(directory / 'base-decoder.int8.onnx'),
                 tokens=str(directory / 'base-tokens.txt'),
-                language='ru',
+                language=self.language,
                 task='transcribe',
                 provider='cpu',
                 num_threads=min(4, max(2, (os.cpu_count() or 2) // 2)),
@@ -274,6 +282,7 @@ class Asr:
 
     def transcribe(self, pcm_bytes):
         self.last_reason = 'unintelligible'
+        self.last_language = ''
         samples = _pcm_to_samples(pcm_bytes)
         if samples is None:
             if len(pcm_bytes) < int(MIN_SECONDS * SAMPLE_RATE) * CHANNELS * SAMPLE_WIDTH:
@@ -290,5 +299,7 @@ class Asr:
         stream.accept_waveform(16000, samples)
         recognizer.decode_stream(stream)
         text = _clean_transcript(stream.result.text)
+        detected = getattr(stream.result, 'lang', '')
+        self.last_language = detected if isinstance(detected, str) else ''
         self.last_reason = 'recognized' if text else 'unintelligible'
         return text
