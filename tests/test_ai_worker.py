@@ -6,12 +6,14 @@ import math
 from pathlib import Path
 import sys
 import threading
+import types
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from http.server import ThreadingHTTPServer
 from ai_worker import ConversationService, OllamaClient, make_handler, audio_to_pcm, VOICE_TEST_TEXT
+from ai_reply import CLARIFICATION, MAX_REPLY_CHARS, REPLY_SCHEMA, RejectedReply
 
 
 class FakeAsr:
@@ -37,7 +39,7 @@ def service(llm=None):
     return ConversationService(FakeAsr(), FakeVoice(), llm or FakeLlm(), to_pcm=lambda a, r: b'\0' * 3840)
 
 
-class OllamaLatencyTests(unittest.TestCase):
+class OllamaReplyContractTests(unittest.TestCase):
     @staticmethod
     def client_with_reply(text):
         client = OllamaClient()
@@ -46,7 +48,7 @@ class OllamaLatencyTests(unittest.TestCase):
         return client
 
     def test_real_chat_request_retains_cpu_model_and_disables_thinking(self):
-        client = self.client_with_reply('О, хорош!')
+        client = self.client_with_reply(json.dumps({'reply': 'О, хорош!'}))
         messages = [{'role': 'system', 'content': 'Коротко.'},
                     {'role': 'user', 'content': 'I won the round.'}]
         self.assertEqual(client.complete(messages), 'О, хорош!')
@@ -55,27 +57,33 @@ class OllamaLatencyTests(unittest.TestCase):
         self.assertEqual(request.full_url, 'http://127.0.0.1:11434/api/chat')
         self.assertEqual(payload['messages'], messages)
         self.assertEqual(payload['model'], 'qwen3:4b')
-        self.assertEqual(payload['keep_alive'], '10m')
+        self.assertEqual(payload['keep_alive'], '30m')
         self.assertIs(payload['think'], False)
+        self.assertEqual(payload['format'], REPLY_SCHEMA)
         self.assertEqual(payload['options']['num_gpu'], 0)
-        self.assertEqual(payload['options']['num_predict'], 64)
+        self.assertEqual(payload['options']['num_predict'], 96)
+        self.assertEqual(payload['options']['temperature'], 0.45)
 
-    def test_speech_reply_removes_reasoning_and_normalizes_whitespace(self):
-        client = self.client_with_reply('<think>Private internal reasoning.</think>\n**О, привет!**\n  Как   дела?')
+    def test_json_envelope_is_parsed_without_speaking_its_labels(self):
+        client = self.client_with_reply(json.dumps({'reply': '  О, привет! Как дела?  '}))
         self.assertEqual(client.complete([]), 'О, привет! Как дела?')
 
-    def test_long_spoken_reply_ends_at_a_complete_sentence(self):
-        first = 'Ого, хорош, ты этот раунд очень красиво забрал!'
-        client = self.client_with_reply(first + ' ' + 'Сейчас я расскажу длинную историю без остановки ' * 20)
-        result = client.complete([])
-        self.assertEqual(result, first)
-        self.assertLessEqual(len(result), 240)
+    def test_reasoning_and_role_narration_are_rejected_as_a_whole(self):
+        for raw in (
+            '<think>Private internal reasoning.</think> Приветики!',
+            json.dumps({'reply': '<think>Нужно ответить.</think> Приветики!'}),
+            json.dumps({'reply': 'Хорошо, пользователь написал "जिके". Сначала нужно понять, что он имел в виду.'}),
+            json.dumps({'reply': 'Луна: Привет! Пользователь: Как дела?'}),
+        ):
+            with self.subTest(raw=raw), self.assertRaises(RejectedReply):
+                self.client_with_reply(raw).complete([])
 
-    def test_long_reply_without_sentence_break_keeps_whole_words(self):
-        client = self.client_with_reply('слово ' * 100)
-        result = client.complete([])
-        self.assertLessEqual(len(result), 240)
-        self.assertRegex(result, r'^(?:слово )*слово\.$')
+    def test_long_malformed_and_extra_field_outputs_are_not_salvaged(self):
+        for raw in (json.dumps({'reply': 'О, привет! ' + 'а' * MAX_REPLY_CHARS}),
+                    '{"reply":"Привет',
+                    json.dumps({'reply': 'Привет!', 'analysis': 'private plan'})):
+            with self.subTest(raw=raw), self.assertRaises(RejectedReply):
+                self.client_with_reply(raw).complete([])
 
 
 class WorkerTests(unittest.TestCase):
@@ -262,7 +270,7 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(diagnostic, {'status': 'answered', 'heard': heard, 'answer': answer})
 
     def test_no_speech_does_not_create_a_reply_or_conversation_turn(self):
-        for reason in ('no_speech', 'too_short', 'unintelligible'):
+        for reason in ('no_speech', 'too_short', 'unintelligible', 'unsupported_language'):
             with self.subTest(reason=reason):
                 asr = Mock(last_reason=reason)
                 asr.transcribe.return_value = ''
@@ -275,19 +283,103 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(worker.diagnostic('g:c', 'u'),
                                  {'status': 'skipped', 'heard': '', 'answer': '', 'reason': reason})
 
-    def test_style_examples_never_become_fake_conversation_history(self):
+    def test_only_actual_voice_turns_enter_history_and_assistant_contract_stays_consistent(self):
         llm = FakeLlm()
         worker = service(llm)
         worker.reply('g:c', 'u', b'\0' * 3840)
         self.assertEqual([m['role'] for m in llm.calls[0]], ['system', 'user'])
-        self.assertIn('не события текущего разговора', llm.calls[0][0]['content'])
+        self.assertNotIn('Пример реплики:', llm.calls[0][0]['content'])
+        self.assertNotIn('Пример ответа:', llm.calls[0][0]['content'])
         self.assertEqual(llm.calls[0][1], {'role': 'user', 'content': 'Привет, как дела?'})
         worker.reply('g:c', 'other', b'\0' * 3840)
-        self.assertEqual(llm.calls[1][1:], [
-            {'role': 'user', 'content': 'Привет, как дела?'},
-            {'role': 'assistant', 'content': 'Привет! Отлично, а у тебя?'},
-            {'role': 'user', 'content': 'Привет, как дела?'},
-        ])
+        self.assertEqual(llm.calls[1][1], {'role': 'user', 'content': 'Привет, как дела?'})
+        self.assertEqual(llm.calls[1][2]['role'], 'assistant')
+        self.assertEqual(json.loads(llm.calls[1][2]['content']), {'reply': 'Привет! Отлично, а у тебя?'})
+        self.assertEqual(llm.calls[1][3], {'role': 'user', 'content': 'Привет, как дела?'})
+
+    def test_actual_hindi_misrecognition_is_blocked_before_llm_and_voice(self):
+        import numpy as np
+        from ai_asr import Asr
+
+        engine = Asr('/unused', language='auto')
+        stream = types.SimpleNamespace(result=types.SimpleNamespace(text='जिके', lang='hi'),
+                                       accept_waveform=Mock())
+        recognizer = types.SimpleNamespace(create_stream=Mock(return_value=stream), decode_stream=Mock())
+        # Exercise actual PCM conversion and transcript filtering; only VAD and
+        # model inference are substituted so the reported regression is fixed.
+        mono = np.full(14_400, 3000, dtype='<i2')
+        pcm = np.column_stack((mono, mono)).tobytes()
+        voice, llm = Mock(), Mock()
+        worker = ConversationService(engine, voice, llm)
+        with patch.object(engine, '_speech_samples', side_effect=lambda samples: samples), \
+             patch.object(engine, '_load', return_value=recognizer):
+            self.assertEqual(worker.reply('g:c', 'u', pcm), {'skipped': True})
+        self.assertEqual(recognizer.decode_stream.call_count, 1)
+        llm.complete.assert_not_called()
+        voice.synthesize.assert_not_called()
+        self.assertEqual(worker.history, {})
+        self.assertEqual(worker.diagnostic('g:c', 'u'), {
+            'status': 'skipped', 'heard': '', 'answer': '', 'reason': 'unsupported_language', 'language': 'hi',
+        })
+
+    def test_valid_heard_phrase_with_model_narration_gets_one_safe_clarification(self):
+        worker = service()
+        worker.reply('g:c', 'u', b'\0' * 3840)
+        previous = list(worker.history['g:c'])
+        narration = 'Хорошо, пользователь написал "जिके". Сначала нужно понять, что он имел в виду.'
+        worker.llm = Mock()
+        worker.llm.complete.return_value = narration
+        worker.voice = Mock()
+        worker.voice.synthesize.return_value = ([0.1, -0.1], 24000)
+        response = worker.reply('g:c', 'u', b'\0' * 3840)
+        self.assertIn('audio_pcm', response)
+        worker.llm.complete.assert_called_once()
+        worker.voice.synthesize.assert_called_once_with(CLARIFICATION)
+        self.assertEqual(list(worker.history['g:c']), previous)
+        diagnostic = worker.diagnostic('g:c', 'u')
+        self.assertEqual(diagnostic['heard'], 'Привет, как дела?')
+        self.assertEqual(diagnostic['answer'], CLARIFICATION)
+        self.assertEqual(diagnostic['reason'], 'rejected_reply')
+        self.assertEqual(diagnostic['rejection'], 'reasoning')
+        self.assertNotIn(narration, json.dumps(diagnostic, ensure_ascii=False))
+
+    def test_model_json_parse_failures_use_one_clarification_without_poisoning_history(self):
+        for raw in ('{"reply":"Привет', '<think>Need to answer privately.',
+                    json.dumps({'reply': 'Привет!', 'analysis': 'private explanation'})):
+            with self.subTest(raw=raw):
+                client = OllamaReplyContractTests.client_with_reply(raw)
+                voice = Mock()
+                voice.synthesize.return_value = ([0.1, -0.1], 24000)
+                worker = ConversationService(FakeAsr(), voice, client, to_pcm=lambda a, r: b'\0' * 3840)
+                self.assertIn('audio_pcm', worker.reply('g:c', 'u', b'\0' * 3840))
+                self.assertEqual(client.opener.open.call_count, 1)
+                voice.synthesize.assert_called_once_with(CLARIFICATION)
+                self.assertEqual(worker.history, {})
+                diagnostic = worker.diagnostic('g:c', 'u')
+                self.assertEqual(diagnostic['answer'], CLARIFICATION)
+                self.assertEqual(diagnostic['reason'], 'rejected_reply')
+                self.assertNotIn(raw, json.dumps(diagnostic, ensure_ascii=False))
+
+    def test_non_greeting_voice_questions_in_all_supported_languages_reach_the_model(self):
+        for heard, language, answer in (
+            ('Я забрал раунд в кс', 'ru', 'Ого, хорош. Только не зазнавайся, звезда.'),
+            ('Як справи?', 'uk', 'Теперь повеселее. А ты как?'),
+            ('Can you hear me?', 'en', 'Да, слышу. Говори.'),
+        ):
+            with self.subTest(heard=heard):
+                asr = Mock(last_language=language)
+                asr.transcribe.return_value = heard
+                client = OllamaReplyContractTests.client_with_reply(json.dumps({'reply': answer}))
+                voice = Mock()
+                voice.synthesize.return_value = ([0.1, -0.1], 24000)
+                worker = ConversationService(asr, voice, client, to_pcm=lambda a, r: b'\0' * 3840)
+                self.assertIn('audio_pcm', worker.reply('g:c', 'u', b'\0' * 3840))
+                client.opener.open.assert_called_once()
+                payload = json.loads(client.opener.open.call_args.args[0].data)
+                self.assertEqual([item['role'] for item in payload['messages']], ['system', 'user'])
+                self.assertEqual(payload['messages'][-1]['content'], heard)
+                voice.synthesize.assert_called_once_with(answer)
+                self.assertEqual(list(worker.history['g:c']), [('u', heard, answer)])
 
     def test_diagnostics_are_isolated_and_cleared_with_shared_context(self):
         worker = service()
@@ -401,6 +493,44 @@ class WorkerTests(unittest.TestCase):
     def test_ollama_cannot_be_a_remote_cloud_endpoint(self):
         with self.assertRaises(ValueError):
             OllamaClient('https://api.example.com')
+
+    def test_http_rejects_text_messages_and_non_objects_without_inference(self):
+        asr, voice, llm = Mock(), Mock(), Mock()
+        worker = ConversationService(asr, voice, llm)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(worker, 'test-only-secret'))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def request(route, body):
+            connection = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=5)
+            try:
+                connection.request('POST', route, json.dumps(body), {'Authorization': 'Bearer test-only-secret'})
+                response = connection.getresponse()
+                response.read()
+                return response.status
+            finally:
+                connection.close()
+
+        ids = {'conversation': 'g:c', 'user': 'u'}
+        pcm = dict(ids, audio_pcm=base64.b64encode(b'\0' * 3840).decode())
+        for body in (
+            dict(ids, text='Привет из текстового чата'),
+            dict(ids, messages=[{'role': 'user', 'content': 'Привет из чата'}]),
+            dict(pcm, text='Дополнительное текстовое сообщение'),
+            dict(pcm, messages=[{'role': 'user', 'content': 'Привет из чата'}]),
+            dict(pcm, history='old text messages'),
+            [], None, 'Просто текст', 7,
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(request('/reply', body), 400)
+        self.assertEqual(request('/text', dict(ids, text='Привет')), 404)
+        self.assertEqual(request('/chat', dict(ids, messages=[])), 404)
+        asr.transcribe.assert_not_called()
+        llm.complete.assert_not_called()
+        voice.synthesize.assert_not_called()
+        self.assertEqual(worker.history, {})
 
     def test_http_protocol_authentication_and_functional_request(self):
         worker = service()

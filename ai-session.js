@@ -6,6 +6,8 @@ import {
 } from '@discordjs/voice';
 import { SILENCE } from './clips.js';
 
+export const PLAYBACK_TAIL_MS = 500;
+
 export class LocalWorker {
   constructor(url, token, fetcher = fetch) {
     const parsed = new URL(url);
@@ -28,8 +30,8 @@ export class LocalWorker {
 }
 
 export class ConversationSession {
-  constructor({ channel, worker, onClose, onError, ignored = new Set() }) {
-    Object.assign(this, { channel, worker, onClose, onError, ignored });
+  constructor({ channel, worker, onClose, onError, ignored = new Set(), now = () => performance.now() }) {
+    Object.assign(this, { channel, worker, onClose, onError, ignored, now });
     this.guild = channel.guild;
     this.key = `${this.guild.id}:${channel.id}`;
     this.captures = new Map();
@@ -38,6 +40,7 @@ export class ConversationSession {
     this.pending = null;
     this.receiveDiagnostics = new Map();
     this.playbackUser = null;
+    this.captureAfter = 0;
     this.epoch = 0;
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.player.on('error', error => this.fail(error));
@@ -45,6 +48,9 @@ export class ConversationSession {
       if (this.playbackUser) {
         const user = this.playbackUser;
         this.playbackUser = null;
+        // A participant's microphone can deliver the loudspeaker tail after
+        // Discord has finished playback. Do not begin a new recording yet.
+        this.captureAfter = this.now() + PLAYBACK_TAIL_MS;
         if (this.receiveDiagnostics.get(user)?.stage === 'playing') this.note(user, 'completed');
       }
       this.drainPending();
@@ -100,6 +106,7 @@ export class ConversationSession {
       self_mute: Boolean(ownVoice?.selfMute),
       server_mute: Boolean(ownVoice?.serverMute),
       user_muted: Boolean(member?.voice.selfMute || member?.voice.serverMute),
+      cooldown_ms: Math.max(0, Math.ceil(this.captureAfter - this.now())),
     };
   }
 
@@ -109,6 +116,12 @@ export class ConversationSession {
     if (!this.canListen(user) || this.captures.has(user)) return;
     if (this.player.state.status !== AudioPlayerStatus.Idle) {
       this.note(user, 'playback_blocked');
+      return;
+    }
+    if (this.now() < this.captureAfter) {
+      // Suppress this whole start event rather than re-subscribing mid-tail.
+      // A fresh utterance after the guard will create a new speaking start.
+      this.note(user, 'echo_blocked');
       return;
     }
     const stream = this.connection.receiver.subscribe(user, {
@@ -241,6 +254,7 @@ export class ConversationSession {
     this.epoch++;
     this.pending = null;
     this.receiveDiagnostics.clear();
+    if (this.playbackUser) this.captureAfter = this.now() + PLAYBACK_TAIL_MS;
     this.playbackUser = null;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
@@ -262,6 +276,7 @@ export class ConversationSession {
     this.pending = null;
     this.receiveDiagnostics.clear();
     this.playbackUser = null;
+    this.captureAfter = 0;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
     this.player.stop(true);

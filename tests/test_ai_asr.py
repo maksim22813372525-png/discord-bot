@@ -236,6 +236,31 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(engine.transcribe(b'\0' * 48000 * 4), '')
             self.assertEqual(engine.last_language, '')
 
+    def test_unsupported_language_or_script_is_rejected_with_actual_diagnostics(self):
+        result = types.SimpleNamespace(text='जिके', lang='hi')
+        stream = types.SimpleNamespace(result=result, accept_waveform=Mock())
+        recognizer = types.SimpleNamespace(create_stream=lambda: stream, decode_stream=Mock())
+        engine = ai_asr.Asr('/unused')
+        with patch.object(engine, '_speech_samples', side_effect=lambda x: x), patch.object(engine, '_load', return_value=recognizer):
+            for text, language in [('जिके', 'hi'), ('jike', 'hi'), ('जिके', 'ru'),
+                                   ('こんにちは', ''), ('Привет, 世界', 'ru')]:
+                with self.subTest(text=text, language=language):
+                    result.text, result.lang = text, language
+                    self.assertEqual(engine.transcribe(self.tone()), '')
+                    self.assertEqual(engine.last_reason, 'unsupported_language')
+                    self.assertEqual(engine.last_language, language)
+            result.text, result.lang = 'Привіт, GG!', 'uk'
+            self.assertEqual(engine.transcribe(self.tone()), 'Привіт, GG!')
+            self.assertEqual(engine.last_reason, 'recognized')
+
+    def test_script_guard_preserves_supported_slang_numbers_and_emoji(self):
+        for text, language in [('Я взяв clutch, GG 😎', 'uk'), ('І ще є ґудзик', 'uk'),
+                               ('Сука, забрал раунд!', 'ru'), ('nice, gg!', 'en'),
+                               ('cafe\u0301, déjà vu', 'en'), ('123', ''), ('Привет hello', '')]:
+            with self.subTest(text=text):
+                self.assertEqual(ai_asr._transcript_rejection_reason(text, language), '')
+        self.assertEqual(ai_asr._transcript_rejection_reason('___', ''), 'unintelligible')
+
     def test_vad_rejects_non_speech_before_whisper_can_invent_words(self):
         engine = ai_asr.Asr('/unused')
         vad = types.SimpleNamespace(reset=Mock(), accept_waveform=Mock(), flush=Mock(), empty=lambda: True)

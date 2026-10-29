@@ -5,11 +5,11 @@ import { PassThrough } from 'node:stream';
 import { setImmediate as tick } from 'node:timers/promises';
 import OpusScript from 'opusscript';
 import { AudioPlayerStatus, VoiceConnectionStatus } from '@discordjs/voice';
-import { ConversationSession, LocalWorker } from '../ai-session.js';
+import { ConversationSession, LocalWorker, PLAYBACK_TAIL_MS } from '../ai-session.js';
 import { definitions, registerCommands } from '../ai-bot.js';
 import { formatDiagnostic } from '../ai-status.js';
 
-function fixture(t, post) {
+function fixture(t, post, now) {
   const streams = new Map();
   const errors = [];
   const members = new Map([
@@ -23,7 +23,7 @@ function fixture(t, post) {
   } };
   const session = new ConversationSession({
     channel: { id: 'c', guild: { id: 'g', members: { cache: members } } },
-    worker, onClose() {}, onError: e => errors.push(e),
+    worker, onClose() {}, onError: e => errors.push(e), now,
   });
   session.connection = {
     state: { status: VoiceConnectionStatus.Ready },
@@ -145,6 +145,71 @@ test('bots, opted-out members, and playback are excluded', t => {
   session.player = { state: { status: AudioPlayerStatus.Playing }, stop() {} };
   session.capture('u'); session.player = original;
   assert.equal(streams.size, 0);
+});
+
+test('delayed microphone echo is blocked after real playback but fresh speech is accepted after the guard', async t => {
+  let now = 1000;
+  const { session, streams, calls } = fixture(t, undefined, () => now);
+  session.playbackUser = 'u';
+  session.note('u', 'playing');
+  session.player.emit(AudioPlayerStatus.Idle);
+  session.capture('u');
+  assert.equal(streams.size, 0);
+  assert.equal(session.diagnostic('u').stage, 'echo_blocked');
+  assert.equal(session.diagnostic('u').cooldown_ms, PLAYBACK_TAIL_MS);
+  now += PLAYBACK_TAIL_MS - 1;
+  session.capture('u');
+  assert.equal(streams.size, 0);
+  now += 1;
+  session.capture('u');
+  for (const packet of opusSpeech()) streams.get('u').write(packet);
+  streams.get('u').end();
+  await tick();
+  assert.equal(calls.filter(c => c.route === '/reply').length, 1);
+  assert.equal(session.diagnostic('u').cooldown_ms, 0);
+});
+
+test('idle without actual bot playback does not delay microphone capture', t => {
+  const { session, streams } = fixture(t, undefined, () => 1000);
+  session.player.emit(AudioPlayerStatus.Idle);
+  session.player.emit(AudioPlayerStatus.Idle);
+  session.capture('u');
+  assert.equal(streams.size, 1);
+  assert.equal(session.diagnostic('u').cooldown_ms, 0);
+});
+
+test('a genuine pending turn is processed immediately while new playback-tail recordings are blocked', async t => {
+  const { session, calls, streams } = fixture(t, undefined, () => 1000);
+  session.busy = true;
+  await session.respond('u', Buffer.alloc(3840));
+  session.busy = false;
+  session.playbackUser = 'u';
+  session.player.emit(AudioPlayerStatus.Idle);
+  session.capture('u');
+  await tick();
+  assert.equal(calls.filter(c => c.route === '/reply').length, 1);
+  assert.equal(session.pending, null);
+  assert.equal(streams.size, 0);
+});
+
+test('forgetting during playback guards its tail without restoring deleted diagnostics', async t => {
+  let now = 1000;
+  const { session, streams } = fixture(t, undefined, () => now);
+  await session.forget();
+  assert.equal(session.diagnostic('u').cooldown_ms, 0);
+  session.playbackUser = 'u';
+  session.note('u', 'playing');
+  await session.forget();
+  assert.equal(session.diagnostic('u').stage, 'none');
+  assert.equal(session.diagnostic('u').cooldown_ms, PLAYBACK_TAIL_MS);
+  session.capture('u');
+  assert.equal(streams.size, 0);
+  now += PLAYBACK_TAIL_MS;
+  session.capture('u');
+  assert.equal(streams.size, 1);
+  session.stop();
+  assert.equal(session.receiveDiagnostics.size, 0);
+  assert.equal(session.captureAfter, 0);
 });
 
 test('speech starting during inference is captured and processed when inference finishes', async t => {
@@ -322,9 +387,13 @@ test('private diagnostics distinguish missing audio, input mute, recognition and
   assert.match(failure, /Ошибка при обработке звука/);
   assert.doesNotMatch(failure, /аудио из Discord пока не пришло/);
   assert.match(formatDiagnostic('v', { ...base, stage: 'playback_blocked' }, none), /во время ответа бота/);
+  assert.match(formatDiagnostic('v', { ...base, stage: 'echo_blocked' }, none), /остаток звука/);
   const heard = { ...base, received_packets: 30, duration_ms: 1800, stage: 'requesting' };
   assert.match(formatDiagnostic('v', heard, { status: 'recognizing' }), /Распознаю речь/);
   assert.match(formatDiagnostic('v', heard, { status: 'synthesizing', heard: 'How are you?', language: 'en' }), /How are you/);
   assert.match(formatDiagnostic('v', heard, { status: 'failed' }), /завершилась с ошибкой/);
   assert.match(formatDiagnostic('v', heard, { status: 'skipped' }), /речь не распознана/);
+  assert.match(formatDiagnostic('v', heard, { status: 'skipped', reason: 'unsupported_language' }), /неподдерживаемый язык/);
+  assert.match(formatDiagnostic('v', heard, { status: 'answered', reason: 'rejected_reply' }), /Рассуждение модели отброшено/);
+  assert.match(formatDiagnostic('v', heard, { status: 'answered', model_metrics: { load_seconds: 0.1, tokens_per_second: 40 } }), /40 токенов\/с/);
 });

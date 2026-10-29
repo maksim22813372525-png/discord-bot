@@ -20,6 +20,9 @@ import time
 import urllib.request
 from urllib.parse import urlsplit
 from ai_persona import SYSTEM_PROMPT, direct_reply
+from ai_reply import CLARIFICATION, REPLY_SCHEMA, RejectedReply, parse_reply, validate_spoken_reply
+from ai_asr import _transcript_rejection_reason
+from ai_performance import KEEP_ALIVE, cpu_threads, model_metrics, ollama_options
 
 MAX_REQUEST_BYTES = 6_000_000
 MAX_PCM_BYTES = 48_000 * 2 * 2 * 20
@@ -34,12 +37,15 @@ class OllamaClient:
         self.url = base_url.rstrip('/') + '/api/chat'
         self.model = model
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.options = ollama_options()
+        self.last_metrics = {}
 
     def warmup(self):
-        """Load the CPU model before the first Discord conversation turn."""
-        request = urllib.request.Request(self.url.removesuffix('/chat') + '/generate',
-            json.dumps({'model': self.model, 'prompt': '', 'stream': False, 'keep_alive': '10m',
-                        'options': {'num_gpu': 0, 'num_ctx': 3072}}).encode(),
+        """Load weights and prefill the real system prefix, without a user turn."""
+        request = urllib.request.Request(self.url,
+            json.dumps({'model': self.model, 'messages': [{'role': 'system', 'content': SYSTEM_PROMPT}],
+                        'stream': False, 'think': False, 'format': REPLY_SCHEMA,
+                        'keep_alive': KEEP_ALIVE, 'options': {**self.options, 'num_predict': 1}}).encode(),
             {'Content-Type': 'application/json'})
         with self.opener.open(request, timeout=180) as response:
             data = json.load(response)
@@ -49,26 +55,19 @@ class OllamaClient:
     def complete(self, messages):
         body = json.dumps({
             'model': self.model, 'messages': messages, 'stream': False, 'think': False,
+            'format': REPLY_SCHEMA,
             # Retain the CPU model in RAM between turns instead of reloading
-            # several GB for every reply. It expires after 10 idle minutes.
-            'keep_alive': '10m',
+            # several GB for every reply. It expires after 30 idle minutes.
+            'keep_alive': KEEP_ALIVE,
             # Keep the GPU available to speech synthesis on an 8 GB card.
-            'options': {'num_gpu': 0, 'num_ctx': 3072, 'num_predict': 64, 'temperature': 0.6},
+            'options': self.options,
         }).encode()
         request = urllib.request.Request(self.url, body, {'Content-Type': 'application/json'})
+        self.last_metrics = {}
         with self.opener.open(request, timeout=180) as response:
             data = json.load(response)
-        text = data.get('message', {}).get('content', '')
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.S).strip()
-        text = re.sub(r'[*_`#]', '', text)
-        if not text:
-            raise RuntimeError('Ollama повернула порожню відповідь.')
-        text = ' '.join(text.split())
-        if len(text) > 240:
-            short = text[:240]
-            sentence = max(short.rfind('.'), short.rfind('!'), short.rfind('?'))
-            text = short[:sentence + 1] if sentence >= 40 else short.rsplit(' ', 1)[0].rstrip(',;:') + '.'
-        return text
+        self.last_metrics = model_metrics(data)
+        return parse_reply(data.get('message', {}).get('content', ''))
 
 
 class ConversationService:
@@ -97,6 +96,8 @@ class ConversationService:
             result = dict(self.last_turns.get((conversation, user), {'status': 'none', 'heard': '', 'answer': ''}))
             if 'timings' in result:
                 result['timings'] = dict(result['timings'])
+            if 'model_metrics' in result:
+                result['model_metrics'] = dict(result['model_metrics'])
             return result
 
     def _diagnose(self, conversation, user, version, **values):
@@ -145,9 +146,12 @@ class ConversationService:
             engine = getattr(self.asr, 'engine', '')
             if isinstance(engine, str) and re.fullmatch(r'[a-z0-9-]{1,60}', engine):
                 language['engine'] = engine
-            if not heard or cancelled():
+            rejected_transcript = _transcript_rejection_reason(heard, detected if isinstance(detected, str) else '')
+            if not heard or rejected_transcript or cancelled():
                 reason = getattr(self.asr, 'last_reason', 'unintelligible')
-                if reason not in ('no_speech', 'too_short', 'unintelligible'):
+                if heard and rejected_transcript:
+                    reason = rejected_transcript
+                if reason not in ('no_speech', 'too_short', 'unintelligible', 'unsupported_language'):
                     reason = 'unintelligible'
                 self._diagnose(conversation, user, version, status='skipped', heard='', answer='',
                                reason=reason, **language)
@@ -158,11 +162,21 @@ class ConversationService:
                 previous = list(self.history.get(conversation, []))
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
             for _, question, previous_answer in previous:
-                messages.extend([{'role': 'user', 'content': question}, {'role': 'assistant', 'content': previous_answer}])
+                messages.extend([{'role': 'user', 'content': question},
+                                 {'role': 'assistant', 'content': json.dumps({'reply': previous_answer}, ensure_ascii=False)}])
             messages.append({'role': 'user', 'content': heard})
             step_started = time.monotonic()
-            answer = direct_reply(heard) or self.llm.complete(messages)
+            rejected = None
+            direct_answer = direct_reply(heard)
+            try:
+                answer = validate_spoken_reply(direct_answer if direct_answer is not None else self.llm.complete(messages))
+            except RejectedReply as error:
+                # Never speak or retain reasoning, fabricated roles, or broken
+                # model output. No second inference adds another delay.
+                rejected = error.code
+                answer = CLARIFICATION
             timings['thinking'] = round(time.monotonic() - step_started, 2)
+            metrics = self.llm.last_metrics if direct_answer is None and isinstance(self.llm, OllamaClient) else {}
             if cancelled():
                 return {'skipped': True}
             stage = 'synthesizing'
@@ -174,9 +188,14 @@ class ConversationService:
             with self.state_lock:
                 if self.generation.get(conversation, 0) != version or (conversation, user) in self.blocked:
                     return {'skipped': True}
-                self.history.setdefault(conversation, deque(maxlen=6)).append((user, heard, answer))
+                if rejected is None:
+                    self.history.setdefault(conversation, deque(maxlen=6)).append((user, heard, answer))
                 self.last_turns[(conversation, user)] = {'status': 'answered', 'heard': heard, 'answer': answer,
                                                         'timings': timings, **language}
+                if rejected is not None:
+                    self.last_turns[(conversation, user)].update(reason='rejected_reply', rejection=rejected)
+                if metrics:
+                    self.last_turns[(conversation, user)]['model_metrics'] = dict(metrics)
             print('Время ответа: ' + ', '.join(f'{name}={seconds:.2f}s' for name, seconds in timings.items()), flush=True)
             return result
         except Exception as error:
@@ -279,10 +298,14 @@ def make_handler(service, token):
                     self.send_json(413, {'error': 'request_too_large'})
                     return
                 data = json.loads(self.rfile.read(size))
+                if not isinstance(data, dict):
+                    raise ValueError('Expected an object')
                 conversation, user = str(data.get('conversation', '')), str(data.get('user', ''))
                 if not conversation or len(conversation) > 128 or len(user) > 64:
                     raise ValueError('Invalid conversation')
                 if self.path == '/reply':
+                    if set(data) != {'conversation', 'user', 'audio_pcm'}:
+                        raise ValueError('Only voice PCM is accepted')
                     pcm = base64.b64decode(data.get('audio_pcm', ''), validate=True)
                     result = service.reply(conversation, user, pcm)
                 elif self.path == '/test' and user:
@@ -319,6 +342,10 @@ def main():
     from ai_tts import LocalVoice
     data = Path(os.getenv('BOT_DATA_DIR', Path(__file__).resolve().parent / 'data'))
     os.environ.setdefault('HF_HOME', str(data / 'models' / 'huggingface'))
+    import torch
+    threads = cpu_threads()
+    torch.set_num_threads(threads)
+    print(f'CPU: {threads} потоков; языковая модель остаётся в RAM до 30 минут бездействия.', flush=True)
     print('Завантажую локальне розпізнавання…', flush=True)
     asr = create_asr(data / 'models')
     asr._load()

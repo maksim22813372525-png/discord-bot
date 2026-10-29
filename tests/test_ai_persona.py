@@ -39,9 +39,12 @@ class PersonaTests(unittest.TestCase):
             self.assertIsNone(direct_reply(text), text)
         self.assertIn('украинский, английский', SYSTEM_PROMPT)
 
-    def test_persona_declares_voice_only_input_and_examples_are_labelled(self):
+    def test_persona_requires_only_a_direct_spoken_reply_without_fake_dialogue(self):
         self.assertIn('Текстовый чат', SYSTEM_PROMPT)
-        self.assertIn('не события текущего разговора', SYSTEM_PROMPT)
+        self.assertIn('от своего лица', SYSTEM_PROMPT)
+        self.assertIn('единственным полем reply', SYSTEM_PROMPT)
+        self.assertNotIn('Пример реплики:', SYSTEM_PROMPT)
+        self.assertNotIn('Пример ответа:', SYSTEM_PROMPT)
         self.assertIn('ответь честно', SYSTEM_PROMPT)
 
 

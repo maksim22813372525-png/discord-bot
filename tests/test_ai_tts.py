@@ -144,23 +144,24 @@ class LocalVoiceTests(unittest.TestCase):
         first.synthesize("Приветики!")
         self.assertEqual(self.model.generate_voice_clone.call_count, 2)
 
-    def test_warmup_is_explicit_and_generates_two_reusable_social_replies(self):
+    def test_warmup_is_explicit_and_prepares_social_replies_and_safe_clarification(self):
         voice = ai_tts.LocalVoice("local-only.wav")
         self.model.generate_voice_clone.assert_not_called()
         voice.warmup()
         voice.warmup()
         voice.synthesize("Приветики!")
         voice.synthesize("М? Я тут.")
-        self.assertEqual(self.model.generate_voice_clone.call_count, 2)
+        voice.synthesize(ai_tts.CLARIFICATION)
+        self.assertEqual(self.model.generate_voice_clone.call_count, 3)
         self.assertEqual({call.kwargs["text"] for call in self.model.generate_voice_clone.call_args_list},
-                         {"Приветики!", "М? Я тут."})
+                         {"Приветики!", "М? Я тут.", ai_tts.CLARIFICATION})
 
     def test_static_cache_has_fixed_keys_and_does_not_store_oversized_audio(self):
         voice = ai_tts.LocalVoice("local-only.wav")
         for text in ai_tts.STATIC_VOICE_REPLIES:
             voice.synthesize(text)
         self.assertEqual(set(voice._static_cache), ai_tts.STATIC_VOICE_REPLIES)
-        self.assertEqual(len(voice._static_cache), 7)
+        self.assertEqual(len(voice._static_cache), 8)
         self.model.generate_voice_clone.return_value = ([np.zeros(24_000 * 41, dtype=np.float32)], 24_000)
         another = ai_tts.LocalVoice("local-only.wav")
         another.synthesize("Приветики!")

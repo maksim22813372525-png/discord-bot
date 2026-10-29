@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+from ai_reply import CLARIFICATION
 
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -23,7 +24,7 @@ MAX_REFERENCE_SECONDS = 60
 STATIC_VOICE_REPLIES = frozenset((
     "Приветики!", "О, привет!", "Привет-привет!",
     "М? Я тут.", "А? Слушаю.", "Да-да, я здесь.",
-    "Приветики! Я тут. Скажи мне что-нибудь.",
+    "Приветики! Я тут. Скажи мне что-нибудь.", CLARIFICATION,
 ))
 STATIC_CACHE_MAX_SECONDS = 40
 
@@ -120,9 +121,10 @@ class LocalVoice:
             )
 
     def warmup(self):
-        """Prepare the two fixed social replies before joining Discord."""
+        """Prepare fixed social replies and a safe clarification before joining."""
         self.synthesize("Приветики!")
         self.synthesize("М? Я тут.")
+        self.synthesize(CLARIFICATION)
 
     def synthesize(self, text):
         """Return ``(mono_float32_waveform, sample_rate)`` for one Russian turn."""

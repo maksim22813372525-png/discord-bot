@@ -14,6 +14,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import unicodedata
 import urllib.request
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ MIN_RMS = 0.003
 VAD_SAMPLE_RATE = 16_000
 VAD_WINDOW = 512
 VAD_CONTEXT_SECONDS = 0.15
+SUPPORTED_LANGUAGES = ('ru', 'uk', 'en')
 
 
 def ensure_vad(models_dir: Path) -> Path:
@@ -201,10 +203,32 @@ def _clean_transcript(text: str) -> str:
     return text
 
 
+def _transcript_rejection_reason(text: str, language: str = '') -> str:
+    """Reject unsupported language/scripts without guessing a replacement.
+
+    Whisper may confidently call a short Russian nickname Hindi. Keep the
+    detected code for diagnostics, but never feed that accidental transcript
+    into the conversation model. Unknown language is allowed when the letters
+    themselves are Latin/Cyrillic; some recognizer builds omit language data.
+    """
+    if language and language.casefold() not in SUPPORTED_LANGUAGES:
+        return 'unsupported_language'
+    meaningful = False
+    for character in text:
+        if character.isalpha():
+            script_name = unicodedata.name(character, '')
+            if 'LATIN' not in script_name and 'CYRILLIC' not in script_name:
+                return 'unsupported_language'
+            meaningful = True
+        elif character in '0123456789':
+            meaningful = True
+    return '' if meaningful else 'unintelligible'
+
+
 class Asr:
     def __init__(self, models_dir, language=None):
         language = os.getenv('ASR_LANGUAGE', 'auto') if language is None else language
-        if not isinstance(language, str) or language.strip().casefold() not in ('auto', 'ru', 'uk', 'en'):
+        if not isinstance(language, str) or language.strip().casefold() not in ('auto', *SUPPORTED_LANGUAGES):
             raise ValueError('ASR_LANGUAGE must be auto, ru, uk, or en.')
         language = language.strip().casefold()
         # Sherpa enables Whisper language detection with an empty string;
@@ -301,5 +325,9 @@ class Asr:
         text = _clean_transcript(stream.result.text)
         detected = getattr(stream.result, 'lang', '')
         self.last_language = detected if isinstance(detected, str) else ''
-        self.last_reason = 'recognized' if text else 'unintelligible'
+        rejected = _transcript_rejection_reason(text, self.last_language)
+        if rejected:
+            self.last_reason = rejected
+            return ''
+        self.last_reason = 'recognized'
         return text

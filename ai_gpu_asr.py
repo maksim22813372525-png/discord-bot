@@ -11,7 +11,8 @@ import re
 
 from ai_asr import (
     Asr, CHANNELS, MAX_SECONDS, MIN_SECONDS, SAMPLE_RATE, SAMPLE_WIDTH,
-    VAD_SAMPLE_RATE, _clean_transcript, _pcm_to_samples,
+    SUPPORTED_LANGUAGES, VAD_SAMPLE_RATE, _clean_transcript, _pcm_to_samples,
+    _transcript_rejection_reason,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ class GpuAsr:
         self._loaded = False
         self._fallback = False
         self._torch = self._processor = self._model = None
+        self._language_tokens = {}
         self.last_reason = 'no_speech'
         self.last_language = ''
         self.engine = 'pending'
@@ -89,6 +91,14 @@ class GpuAsr:
                 self._model.generation_config.language = None
                 self._model.generation_config.forced_decoder_ids = None
                 self._model.config.forced_decoder_ids = None
+                # Transformers 4.57.3 detect_language masks decoder logits to
+                # the IDs in this map. Limit automatic detection to the three
+                # languages supported by this bot, rather than all 99.
+                self._language_tokens = dict(self._model.generation_config.lang_to_id)
+                self._model.generation_config.lang_to_id = {
+                    f'<|{language}|>': self._language_tokens[f'<|{language}|>']
+                    for language in SUPPORTED_LANGUAGES
+                }
                 # No device_map: loading and the idle state both stay on CPU.
                 self._model.to('cpu')
                 self._loaded = True
@@ -153,7 +163,7 @@ class GpuAsr:
             sequences = generated.sequences.detach().cpu()
             language = language_from_tokens(
                 self._processor.tokenizer, sequences[0].tolist(),
-                self._model.generation_config.lang_to_id,
+                self._language_tokens,
             )
             text = _clean_transcript(self._processor.batch_decode(sequences, skip_special_tokens=True)[0])
         except Exception as error:
@@ -177,5 +187,9 @@ class GpuAsr:
             self._use_cpu(failure)
             return self._cpu_transcribe(pcm)
         self.last_language = language
-        self.last_reason = 'recognized' if text else 'unintelligible'
+        rejected = _transcript_rejection_reason(text, language)
+        if rejected:
+            self.last_reason = rejected
+            return ''
+        self.last_reason = 'recognized'
         return text

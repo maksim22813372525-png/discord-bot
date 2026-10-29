@@ -38,7 +38,9 @@ class GpuAsrTests(unittest.TestCase):
         self.model.generation_config.language = 'en'
         self.model.generation_config.forced_decoder_ids = [[1, 3]]
         self.model.config.forced_decoder_ids = [[1, 3]]
-        self.model.generation_config.lang_to_id = {'<|ru|>': 1, '<|uk|>': 2, '<|en|>': 3}
+        self.model.generation_config.lang_to_id = {
+            '<|ru|>': 1, '<|uk|>': 2, '<|en|>': 3, '<|hi|>': 4, '<|ja|>': 5,
+        }
         self.model.generate.return_value = types.SimpleNamespace(sequences=Tensor([[50000, 2, 4, 5, 6]]))
         self.factory = Mock(return_value=self.model)
         self.processor_factory = Mock(return_value=self.processor)
@@ -85,6 +87,11 @@ class GpuAsrTests(unittest.TestCase):
         self.assertIsNone(self.model.generation_config.language)
         self.assertIsNone(self.model.generation_config.forced_decoder_ids)
         self.assertIsNone(self.model.config.forced_decoder_ids)
+        self.assertEqual(self.model.generation_config.lang_to_id,
+                         {'<|ru|>': 1, '<|uk|>': 2, '<|en|>': 3})
+        # Keep the real original language-token table for diagnostic parsing:
+        # a rogue prefix must not be relabelled as an unknown/supported language.
+        self.assertEqual(engine._language_tokens['<|hi|>'], 4)
 
     def test_real_pcm_preprocessing_and_generation_use_multilingual_greedy_gpu_and_return_to_cpu(self):
         engine = self.engine()
@@ -112,6 +119,21 @@ class GpuAsrTests(unittest.TestCase):
         engine.transcribe(self.pcm)
         self.assertEqual(self.model.generate.call_args.kwargs['language'], 'ru')
         self.assertEqual(engine.last_language, '')
+
+    def test_reported_hindi_regression_and_foreign_script_never_leave_asr(self):
+        engine = self.engine()
+        for text, token, language in [('जिके', '<|hi|>', 'hi'),
+                                      ('jike', '<|hi|>', 'hi'),
+                                      ('जिके', '<|ru|>', 'ru'),
+                                      ('こんにちは', 'unknown', '')]:
+            with self.subTest(text=text, language=language):
+                self.processor.batch_decode.return_value = [text]
+                self.processor.tokenizer.convert_ids_to_tokens.return_value = ['<|startoftranscript|>', token]
+                self.assertEqual(engine.transcribe(self.pcm), '')
+                self.assertEqual(engine.last_reason, 'unsupported_language')
+                self.assertEqual(engine.last_language, language)
+                self.assertEqual(self.model.to.call_args.args, ('cpu',))
+                self.assertFalse(engine._fallback)
 
     def test_no_speech_never_loads_or_calls_gpu_and_clears_diagnostics(self):
         engine = self.engine()
