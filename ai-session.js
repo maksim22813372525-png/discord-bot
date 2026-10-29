@@ -35,9 +35,11 @@ export class ConversationSession {
     this.captures = new Map();
     this.closed = false;
     this.busy = false;
+    this.pending = null;
     this.epoch = 0;
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.player.on('error', error => this.fail(error));
+    this.player.on(AudioPlayerStatus.Idle, () => this.drainPending());
     this.onSpeaking = user => this.capture(user);
   }
 
@@ -53,11 +55,17 @@ export class ConversationSession {
     this.connection.receiver.speaking.on('start', this.onSpeaking);
   }
 
-  capture(user) {
+  canListen(user) {
     const member = this.guild.members.cache.get(user);
-    if (this.closed || this.busy || this.player.state.status !== AudioPlayerStatus.Idle
-      || this.captures.has(user) || !member || member.user.bot || this.ignored.has(user)
-      || member.voice.channelId !== this.channel.id) return;
+    return !this.closed && member && !member.user.bot && !this.ignored.has(user)
+      && member.voice.channelId === this.channel.id;
+  }
+
+  capture(user) {
+    // Start events are edge-triggered: dropping one while inference is busy
+    // loses the whole ongoing utterance, even when inference later finishes.
+    if (!this.canListen(user) || this.player.state.status !== AudioPlayerStatus.Idle
+      || this.captures.has(user)) return;
     const stream = this.connection.receiver.subscribe(user, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
     });
@@ -74,11 +82,12 @@ export class ConversationSession {
       this.captures.delete(user);
       stream.destroy();
       decoder.delete();
-      if (save && !this.closed && !this.ignored.has(user) && speechFrames >= 15) {
+      if (save && !this.closed && !this.ignored.has(user) && speechFrames >= 10) {
         this.respond(user, Buffer.concat(chunks));
       }
     };
     capture.cancel = () => finish(false);
+    capture.finish = () => finish(true);
     this.captures.set(user, capture);
     stream.on('data', packet => {
       if (capture.done) return;
@@ -103,13 +112,16 @@ export class ConversationSession {
   }
 
   async respond(user, pcm) {
-    if (this.closed || this.busy || this.ignored.has(user)) return;
+    if (!this.canListen(user)) return;
+    if (this.busy || this.player.state.status !== AudioPlayerStatus.Idle) {
+      // Keep just the latest complete utterance, not a backlog of old speech.
+      this.pending = { user, pcm: pcm.subarray(0, 3_840_000), epoch: this.epoch };
+      return;
+    }
     this.busy = true;
     const epoch = this.epoch;
     const controller = this.request = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
-    // Discard overlapping utterances rather than queuing old conversations.
-    for (const capture of this.captures.values()) capture.cancel();
     try {
       const response = await this.worker.post('/reply', {
         conversation: this.key, user, audio_pcm: pcm.subarray(0, 3_840_000).toString('base64'),
@@ -120,17 +132,34 @@ export class ConversationSession {
       }
       const audio = Buffer.from(response.audio_pcm, 'base64');
       if (!audio.length || audio.length % 4 || audio.length > 7_680_000) throw new Error('Некоректний PCM.');
+      // End any recording started while thinking before our own audio can
+      // reach a participant's microphone. Its captured prefix can be pending.
+      for (const capture of this.captures.values()) capture.finish();
       this.player.play(createAudioResource(Readable.from([audio]), { inputType: StreamType.Raw }));
     } catch (error) {
       if (error.name !== 'AbortError' && !this.closed) this.onError(error);
     } finally {
       clearTimeout(timeout);
-      if (this.request === controller) { this.request = null; this.busy = false; }
+      if (this.request === controller) {
+        this.request = null;
+        this.busy = false;
+        this.drainPending();
+      }
+    }
+  }
+
+  drainPending() {
+    if (this.closed || this.busy || this.player.state.status !== AudioPlayerStatus.Idle || !this.pending) return;
+    const pending = this.pending;
+    this.pending = null;
+    if (pending.epoch === this.epoch && this.canListen(pending.user)) {
+      void this.respond(pending.user, pending.pcm);
     }
   }
 
   async forget(user) {
     this.epoch++;
+    this.pending = null;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
     this.player.stop(true);
@@ -148,6 +177,7 @@ export class ConversationSession {
     if (this.closed) return;
     this.closed = true;
     this.epoch++;
+    this.pending = null;
     this.request?.abort();
     for (const capture of this.captures.values()) capture.cancel();
     this.player.stop(true);

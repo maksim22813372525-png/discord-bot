@@ -18,17 +18,10 @@ import re
 import threading
 import urllib.request
 from urllib.parse import urlsplit
+from ai_persona import SYSTEM_PROMPT, direct_reply
 
 MAX_REQUEST_BYTES = 6_000_000
 MAX_PCM_BYTES = 48_000 * 2 * 2 * 20
-SYSTEM_PROMPT = (
-    'Ты — Луна, взрослая виртуальная собеседница в голосовом чате. '
-    'Говори по-русски, дружелюбно и немного иронично. Можно шутить про игры '
-    'и добродушно подкалывать. Отвечай естественно, обычно одним-двумя короткими '
-    'предложениями, без списков, эмодзи и описания своих действий. '
-    'Ты самостоятельный вымышленный AI-персонаж. Голосовой референс задаёт тембр, '
-    'а не личность; не представляйся реальным человеком из записи.'
-)
 
 
 class OllamaClient:
@@ -45,7 +38,7 @@ class OllamaClient:
             'model': self.model, 'messages': messages, 'stream': False, 'think': False,
             'keep_alive': 0,
             # Keep the GPU available to speech synthesis on an 8 GB card.
-            'options': {'num_gpu': 0, 'num_ctx': 2048, 'num_predict': 100, 'temperature': 0.8},
+            'options': {'num_gpu': 0, 'num_ctx': 3072, 'num_predict': 90, 'temperature': 0.6},
         }).encode()
         request = urllib.request.Request(self.url, body, {'Content-Type': 'application/json'})
         with self.opener.open(request, timeout=180) as response:
@@ -63,6 +56,7 @@ class ConversationService:
         self.asr, self.voice, self.llm = asr, voice, llm
         self.to_pcm = to_pcm or audio_to_pcm
         self.history = {}
+        self.last_turns = {}
         self.generation = {}
         self.blocked = set()
         self.state_lock = threading.Lock()
@@ -76,6 +70,17 @@ class ConversationService:
             # Other participants' replies may quote this user. Clearing the
             # shared context also removes those derived references.
             self.history.pop(conversation, None)
+            self.last_turns = {key: value for key, value in self.last_turns.items() if key[0] != conversation}
+
+    def diagnostic(self, conversation, user):
+        with self.state_lock:
+            return dict(self.last_turns.get((conversation, user), {'status': 'none', 'heard': '', 'answer': ''}))
+
+    def _diagnose(self, conversation, user, version, **values):
+        with self.state_lock:
+            if self.generation.get(conversation, 0) != version or (conversation, user) in self.blocked:
+                return
+            self.last_turns[(conversation, user)] = values
 
     def allow(self, conversation, user):
         with self.state_lock:
@@ -107,14 +112,17 @@ class ConversationService:
                 return {'skipped': True}
             heard = self.asr.transcribe(pcm).strip()
             if not heard or cancelled():
+                self._diagnose(conversation, user, version, status='skipped', heard='', answer='',
+                               reason=getattr(self.asr, 'last_reason', 'unintelligible'))
                 return {'skipped': True}
+            self._diagnose(conversation, user, version, status='thinking', heard=heard, answer='')
             with self.state_lock:
                 previous = list(self.history.get(conversation, []))
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
             for _, question, answer in previous:
                 messages.extend([{'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer}])
             messages.append({'role': 'user', 'content': heard})
-            answer = self.llm.complete(messages)
+            answer = direct_reply(heard) or self.llm.complete(messages)
             if cancelled():
                 return {'skipped': True}
             samples, rate = self.voice.synthesize(answer)
@@ -125,6 +133,7 @@ class ConversationService:
                 if self.generation.get(conversation, 0) != version or (conversation, user) in self.blocked:
                     return {'skipped': True}
                 self.history.setdefault(conversation, deque(maxlen=6)).append((user, heard, answer))
+                self.last_turns[(conversation, user)] = {'status': 'answered', 'heard': heard, 'answer': answer}
             return {'audio_pcm': base64.b64encode(audio).decode(), 'sample_rate': 48000, 'channels': 2}
         finally:
             self.inference_lock.release()
@@ -191,6 +200,8 @@ def make_handler(service, token):
                 elif self.path == '/allow' and user:
                     service.allow(conversation, user)
                     result = {'ok': True}
+                elif self.path == '/last' and user:
+                    result = service.diagnostic(conversation, user)
                 else:
                     self.send_json(404, {'error': 'not_found'})
                     return

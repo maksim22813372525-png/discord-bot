@@ -9,6 +9,7 @@ export const definitions = [
   ['talk_on', 'Зайти у твій войс і ввімкнути локальну AI-співрозмовницю', true],
   ['talk_off', 'Зупинити розмову та вийти з войсу', true],
   ['talk_clear', 'Очистити пам’ять поточної розмови', true],
+  ['talk_heard', 'Приватно показати, як бот розпізнав твою останню репліку'],
   ['forget_me', 'Не слухати мене та видалити мої репліки з пам’яті'],
   ['remember_me', 'Знову слухати мої репліки'],
 ].map(([name, description, admin]) => {
@@ -39,7 +40,7 @@ export async function main() {
       if (['talk_on', 'talk_off', 'talk_clear'].includes(name) && !i.memberPermissions?.has(restrict)) {
         await i.reply({ content: 'Потрібне право «Керування сервером».', ephemeral: true }); return;
       }
-      await i.deferReply({ ephemeral: name === 'forget_me' || name === 'remember_me' });
+      await i.deferReply({ ephemeral: ['forget_me', 'remember_me', 'talk_heard'].includes(name) });
       let session = sessions.get(i.guildId);
       if (name === 'talk_on') {
         if (session) { await i.editReply('Розмова вже ввімкнена. Спочатку /talk_off.'); return; }
@@ -69,6 +70,12 @@ export async function main() {
       } else if (name === 'talk_clear') {
         await session?.forget();
         await i.editReply('Пам’ять поточної розмови очищено.');
+      } else if (name === 'talk_heard') {
+        if (!session) { await i.editReply('Сначала включи разговор через /talk_on.'); return; }
+        const last = await worker.post('/last', { conversation: session.key, user: i.user.id });
+        if (last.status === 'none') await i.editReply('Твоих распознанных реплик пока нет. Скажи фразу после запуска /talk_on.');
+        else if (last.status === 'skipped') await i.editReply('В последнем фрагменте речь не распознана. Попробуй сказать фразу чётче и проверить уровень микрофона.');
+        else await i.editReply(`Услышала: «${String(last.heard || '').slice(0, 700)}»\n${last.answer ? `Ответ: «${String(last.answer).slice(0, 600)}»` : 'Ответ ещё готовится.'}`);
       } else if (name === 'forget_me') {
         store.ignore(i.guildId, i.user.id);
         if (session) await session.forget(i.user.id);

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import threading
 import unittest
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from http.server import ThreadingHTTPServer
@@ -35,6 +36,68 @@ def service(llm=None):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_greetings_and_aliases_bypass_llm_but_speak_and_record_actual_turns(self):
+        for heard in ('привет', 'Приветики!', 'пр', 'Няшка', 'Альтушка', 'Альтушечка', 'Тянка'):
+            with self.subTest(heard=heard):
+                asr = Mock()
+                asr.transcribe.return_value = heard
+                voice = Mock()
+                voice.synthesize.return_value = ([0.1, -0.1], 24000)
+                llm = Mock()
+                worker = ConversationService(asr, voice, llm, to_pcm=lambda a, r: b'\0' * 3840)
+                result = worker.reply('g:c', 'u', b'\0' * 3840)
+                self.assertIn('audio_pcm', result)
+                llm.complete.assert_not_called()
+                voice.synthesize.assert_called_once()
+                answer = voice.synthesize.call_args.args[0]
+                self.assertTrue(answer)
+                self.assertEqual(list(worker.history['g:c']), [('u', heard, answer)])
+                self.assertEqual(worker.diagnostic('g:c', 'u'),
+                                 {'status': 'answered', 'heard': heard, 'answer': answer})
+
+    def test_no_speech_does_not_create_a_reply_or_conversation_turn(self):
+        for reason in ('no_speech', 'too_short', 'unintelligible'):
+            with self.subTest(reason=reason):
+                asr = Mock(last_reason=reason)
+                asr.transcribe.return_value = ''
+                voice, llm = Mock(), Mock()
+                worker = ConversationService(asr, voice, llm)
+                self.assertEqual(worker.reply('g:c', 'u', b'\0' * 3840), {'skipped': True})
+                voice.synthesize.assert_not_called()
+                llm.complete.assert_not_called()
+                self.assertEqual(worker.history, {})
+                self.assertEqual(worker.diagnostic('g:c', 'u'),
+                                 {'status': 'skipped', 'heard': '', 'answer': '', 'reason': reason})
+
+    def test_style_examples_never_become_fake_conversation_history(self):
+        llm = FakeLlm()
+        worker = service(llm)
+        worker.reply('g:c', 'u', b'\0' * 3840)
+        self.assertEqual([m['role'] for m in llm.calls[0]], ['system', 'user'])
+        self.assertIn('не события текущего разговора', llm.calls[0][0]['content'])
+        self.assertEqual(llm.calls[0][1], {'role': 'user', 'content': 'Привет, как дела?'})
+        worker.reply('g:c', 'other', b'\0' * 3840)
+        self.assertEqual(llm.calls[1][1:], [
+            {'role': 'user', 'content': 'Привет, как дела?'},
+            {'role': 'assistant', 'content': 'Привет! Отлично, а у тебя?'},
+            {'role': 'user', 'content': 'Привет, как дела?'},
+        ])
+
+    def test_diagnostics_are_isolated_and_cleared_with_shared_context(self):
+        worker = service()
+        worker.reply('g:c', 'u', b'\0' * 3840)
+        worker.reply('g:c', 'other', b'\0' * 3840)
+        worker.reply('g:elsewhere', 'u', b'\0' * 3840)
+        self.assertEqual(worker.diagnostic('g:c', 'absent')['status'], 'none')
+        self.assertEqual(worker.diagnostic('g:other', 'u')['status'], 'none')
+        diagnostic = worker.diagnostic('g:c', 'u')
+        diagnostic['heard'] = 'changed outside service'
+        self.assertEqual(worker.diagnostic('g:c', 'u')['heard'], 'Привет, как дела?')
+        worker.forget('g:c', 'u')
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
+        self.assertEqual(worker.diagnostic('g:c', 'other')['status'], 'none')
+        self.assertEqual(worker.diagnostic('g:elsewhere', 'u')['status'], 'answered')
+
     def test_turn_history_and_channel_isolation(self):
         llm = FakeLlm()
         worker = service(llm)
@@ -57,14 +120,41 @@ class WorkerTests(unittest.TestCase):
         thread = threading.Thread(target=lambda: result.append(worker.reply('g:c', 'u', b'\0' * 3840)))
         thread.start()
         self.assertTrue(entered.wait(2))
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'thinking')
         worker.forget('g:c', 'u')
         release.set()
         thread.join(3)
         self.assertEqual(result, [{'skipped': True}])
         self.assertEqual(list(worker.history.get('g:c', [])), [])
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
         self.assertEqual(worker.reply('g:c', 'u', b'\0' * 3840), {'skipped': True})
         worker.allow('g:', 'u')
         self.assertIn('audio_pcm', worker.reply('g:c', 'u', b'\0' * 3840))
+
+    def test_forget_during_asr_cannot_restore_diagnostic_or_synthesize(self):
+        entered, release = threading.Event(), threading.Event()
+        class WaitingAsr:
+            def transcribe(self, pcm):
+                entered.set()
+                release.wait(2)
+                return 'привет'
+        voice, llm = Mock(), Mock()
+        worker = ConversationService(WaitingAsr(), voice, llm)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(worker.reply('g:c', 'u', b'\0' * 3840)))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            worker.forget('g:c', 'u')
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [{'skipped': True}])
+        self.assertEqual(worker.diagnostic('g:c', 'u')['status'], 'none')
+        self.assertEqual(worker.history, {})
+        voice.synthesize.assert_not_called()
+        llm.complete.assert_not_called()
 
     def test_forget_clears_shared_history_including_derived_references(self):
         worker = service()
@@ -121,13 +211,23 @@ class WorkerTests(unittest.TestCase):
                 connection.close()
         data = {'conversation': 'g:c', 'user': 'u', 'audio_pcm': base64.b64encode(b'\0' * 3840).decode()}
         self.assertEqual(request('/reply', data, 'wrong')[0], 401)
+        self.assertEqual(request('/last', data, 'wrong')[0], 401)
         self.assertEqual(worker.history, {})
+        self.assertEqual(request('/last', data)[1]['status'], 'none')
         status, reply = request('/reply', data)
         self.assertEqual(status, 200)
         self.assertEqual(reply['sample_rate'], 48000)
         self.assertEqual(reply['channels'], 2)
+        status, diagnostic = request('/last', data)
+        self.assertEqual(status, 200)
+        self.assertEqual(diagnostic, {'status': 'answered', 'heard': 'Привет, как дела?',
+                                      'answer': 'Привет! Отлично, а у тебя?'})
+        self.assertEqual(request('/last', dict(data, user='other'))[1]['status'], 'none')
+        self.assertEqual(request('/last', dict(data, conversation='g:other'))[1]['status'], 'none')
+        self.assertEqual(request('/last', dict(data, user=''))[0], 404)
         self.assertEqual(request('/reply', dict(data, audio_pcm='!not-base64!'))[0], 400)
         self.assertEqual(request('/forget', {'conversation': 'g:c', 'user': 'u'})[0], 200)
+        self.assertEqual(request('/last', data)[1]['status'], 'none')
         self.assertEqual(request('/reply', data)[1], {'skipped': True})
         self.assertEqual(request('/allow', {'conversation': 'g:', 'user': 'u'})[0], 200)
         self.assertIn('audio_pcm', request('/reply', data)[1])
