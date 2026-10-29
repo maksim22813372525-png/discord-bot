@@ -1,7 +1,16 @@
 .venv/
 .voice-venv/
+.ai-venv/
 .runtime/
 node_modules/
 __pycache__/
 data/
 .env
+reference.wav
+reference.mp4
+voice-reference/
+*.wav
+*.mp3
+*.mp4
+*.ogg
+*.flac
