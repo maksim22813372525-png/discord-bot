@@ -1,0 +1,18 @@
+{
+  "name": "discord-voice-repeater",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Repeat short original voice clips at random intervals in Discord",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node --test --test-isolation=none tests/voice.test.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "0.19.2",
+    "discord.js": "14.27.0"
+  }
+}

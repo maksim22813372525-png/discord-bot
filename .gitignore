@@ -1,4 +1,7 @@
 .venv/
+.voice-venv/
+.runtime/
+node_modules/
 __pycache__/
 data/
 .env

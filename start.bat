@@ -14,16 +14,7 @@ echo Enable "Add python.exe to PATH", then open this file again.
 goto failed
 
 :python_ready
-if exist ".venv\Scripts\python.exe" goto install
-echo Creating the Python environment...
-%BOT_PY% -m venv .venv
-if errorlevel 1 goto failed
-
-:install
-echo Checking dependencies. Internet access is needed on the first run...
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
-if errorlevel 1 goto failed
-".venv\Scripts\python.exe" run_windows.py
+%BOT_PY% run_windows.py
 if errorlevel 1 goto failed
 echo Bot stopped.
 pause
